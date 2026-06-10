@@ -91,3 +91,11 @@ def format_duration(seconds: float) -> str:
     if hours:
         return f"{hours:d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:d}:{secs:02d}"
+
+
+def format_timecode(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"

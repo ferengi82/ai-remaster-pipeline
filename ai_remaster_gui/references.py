@@ -7,19 +7,19 @@ import sys
 import time
 from pathlib import Path
 
-from .config import IMAGE_EXTS, QWEN_IMAGE_EDIT_MODEL, REFERENCE_PROMPT, REFERENCE_PROMPT_SUFFIX, ROOT, SCRIPTS
-from .manifests import read_manifest, read_manifest_details, update_manifest_row, write_manifest_details
-from .media import extract_video_frame_at
+from . import app_context
+from .artifacts import manifest_for_outpainted
+from .config import IMAGE_EXTS, PREVIEW_DIR, QWEN_IMAGE_EDIT_MODEL, REFERENCE_PROMPT, REFERENCE_PROMPT_SUFFIX, ROOT, SCRIPTS, current_config
+from .file_dialogs import browse_path
+from .manifests import manifest_source_video, read_manifest, read_manifest_details, update_manifest_row, write_manifest_details
+from .media import ffprobe_info, local_tool, safe_preview_name
 from .paths import rel, resolve, safe_stem
+from .process_utils import format_timecode
+from .runtime_settings import qwen_masked_workflow_for, qwen_workflow_for
 from .sam_masks import sam2_mask_for_image
 
-if str(SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS))
-import artifact_ids as aid  # noqa: E402
+import artifact_ids as aid  # scripts/ is on sys.path via the package __init__
 
-
-def bind_context(context: dict) -> None:
-    globals().update(context)
 
 
 def recomposition_output_for(outpainted_text: str) -> str:
@@ -98,7 +98,7 @@ def shot_rows(manifest_text: str, include_previews: bool = False) -> list[dict[s
                 "color_reference_mtime": file_mtime(row.get("color_reference", "")),
                 "recent_color_references": recent_color_references(rows, index),
                 "color_reference_versions": reference_edit_versions(manifest_text, index),
-                "masked_edit_available": bool(APP.settings.get("references", {}).get("masked_workflow", "")),
+                "masked_edit_available": bool(app_context.APP.settings.get("references", {}).get("masked_workflow", "")),
                 "can_merge_next": index < len(rows) - 1,
                 "can_split": end - start >= 0.1,
                 "can_fade_next": index < len(rows) - 1,
@@ -190,7 +190,7 @@ def reference_edit_preview_command(manifest_text: str, index: int, instruction: 
     current = output
     if not resolve(current).is_file():
         raise FileNotFoundError(f"Colour reference does not exist yet: {current}")
-    values = APP.settings.get("references", {})
+    values = app_context.APP.settings.get("references", {})
     config = current_config()
     mask = save_reference_edit_mask(manifest_text, index, mask_data)
     edit_output = next_reference_edit_output(manifest_text, index)
@@ -290,7 +290,7 @@ def accept_reference_edit(manifest_text: str, index: int, preview_path: str) -> 
     if not preview.is_file():
         raise FileNotFoundError(f"Edited reference not found: {preview}")
     update_manifest_row(manifest, index, {"color_reference": rel(preview), "color_reference_previous": current})
-    APP.log.append(f"Accepted edited colour reference for shot {index + 1}: {rel(preview)}")
+    app_context.APP.log.append(f"Accepted edited colour reference for shot {index + 1}: {rel(preview)}")
     return {"color_reference": rel(preview), "previous": current}
 
 def revert_reference_edit(manifest_text: str, index: int) -> dict[str, str]:
@@ -305,7 +305,7 @@ def revert_reference_edit(manifest_text: str, index: int) -> dict[str, str]:
     if not resolve(previous).is_file():
         raise FileNotFoundError(f"Previous colour reference not found: {previous}")
     update_manifest_row(manifest, index, {"color_reference": previous, "color_reference_previous": current})
-    APP.log.append(f"Reverted edited colour reference for shot {index + 1}: {previous}")
+    app_context.APP.log.append(f"Reverted edited colour reference for shot {index + 1}: {previous}")
     return {"color_reference": previous, "previous": current}
 
 def sam_reference_mask(manifest_text: str, index: int, points: list[dict], width: int, height: int, tolerance: int = 10) -> dict[str, str]:
@@ -364,13 +364,6 @@ def selected_seconds_from_reference(path_text: str) -> float:
         return 0.0
     return 0.0
 
-def format_timecode(seconds: float) -> str:
-    seconds = max(0.0, float(seconds))
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = seconds % 60
-    return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
-
 def reference_name_for_time(index: int, seconds: float) -> str:
     return f"cut_{index:04d}_{format_timecode(seconds).replace(':', '.')}.png"
 
@@ -397,7 +390,7 @@ def delete_color_reference(manifest_text: str, index: int) -> dict[str, str]:
         if item.exists() and item.is_file():
             item.unlink()
             deleted.append(rel(item))
-    APP.log.append(f"Deleted colour reference for shot {index + 1}: {target}")
+    app_context.APP.log.append(f"Deleted colour reference for shot {index + 1}: {target}")
     return {"deleted": ", ".join(deleted), "color_reference": target}
 
 def install_custom_color_reference(manifest_text: str, index: int) -> dict[str, str]:
@@ -428,7 +421,7 @@ def install_custom_color_reference(manifest_text: str, index: int) -> dict[str, 
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)
     update_manifest_row(manifest, index, {"color_reference": rel(target)})
-    APP.log.append(f"Installed custom color reference for shot {index + 1}: {rel(target)}")
+    app_context.APP.log.append(f"Installed custom color reference for shot {index + 1}: {rel(target)}")
     return {"selected": selected, "color_reference": rel(target)}
 
 def extract_reference_frame(manifest_text: str, index: int, seconds: float) -> dict[str, str]:
@@ -455,7 +448,7 @@ def extract_reference_frame(manifest_text: str, index: int, seconds: float) -> d
         raise RuntimeError((result.stderr or result.stdout or "ffmpeg failed").strip())
     new_color = color_reference_for_source(rel(new_source))
     update_manifest_row(manifest, index, {"source_reference": rel(new_source), "color_reference": new_color})
-    APP.log.append(f"Updated shot {index + 1} reference frame to {format_timecode(seconds)}: {rel(new_source)}")
+    app_context.APP.log.append(f"Updated shot {index + 1} reference frame to {format_timecode(seconds)}: {rel(new_source)}")
     return {"source_reference": rel(new_source), "color_reference": new_color}
 
 def preview_reference_frame(manifest_text: str, index: int, seconds: float) -> str:
@@ -494,7 +487,7 @@ def reference_row_io(manifest_text: str, index: int) -> tuple[Path, dict[str, st
 
 def reference_regeneration_command(manifest_text: str, index: int) -> tuple[list[str], str]:
     _manifest, row, source, output = reference_row_io(manifest_text, index)
-    values = APP.settings.get("references", {})
+    values = app_context.APP.settings.get("references", {})
     config = current_config()
     workflow = qwen_workflow_for(values, config)
     if not workflow:
@@ -537,7 +530,7 @@ def reference_regeneration_command(manifest_text: str, index: int) -> tuple[list
 
 def openai_reference_regeneration_command(manifest_text: str, index: int) -> tuple[list[str], str]:
     manifest, _row, _source, output = reference_row_io(manifest_text, index)
-    values = APP.settings.get("references", {})
+    values = app_context.APP.settings.get("references", {})
     token = values.get("openai_api_key", "").strip()
     if not token:
         raise RuntimeError("Add your OpenAI API key in Settings before generating with OpenAI.")
@@ -569,13 +562,13 @@ def openai_reference_regeneration_command(manifest_text: str, index: int) -> tup
 
 def regenerate_reference_image(manifest_text: str, index: int) -> dict[str, str]:
     cmd, output = reference_regeneration_command(manifest_text, index)
-    APP.log.append("> " + " ".join(cmd))
+    app_context.APP.log.append("> " + " ".join(cmd))
     result = subprocess.run(cmd, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     for line in result.stdout.splitlines():
-        APP.log.append(line)
+        app_context.APP.log.append(line)
     if result.returncode != 0:
         raise RuntimeError(f"Reference regeneration failed with exit code {result.returncode}.")
-    APP.log.append(f"Regenerated colour reference for shot {index + 1}: {output}")
+    app_context.APP.log.append(f"Regenerated colour reference for shot {index + 1}: {output}")
     return {"color_reference": output}
 
 
@@ -592,7 +585,7 @@ def merge_manifest_shots(manifest_text: str, index: int) -> dict[str, str]:
     rows[index]["crossfade_seconds"] = rows[index + 1].get("crossfade_seconds", "")
     removed = rows.pop(index + 1)
     write_manifest_details(manifest, source_video, fieldnames, rows)
-    APP.log.append(f"Merged shot {index + 1} with shot {index + 2}; shared reference: {rows[index].get('source_reference', '')}")
+    app_context.APP.log.append(f"Merged shot {index + 1} with shot {index + 2}; shared reference: {rows[index].get('source_reference', '')}")
     return {"manifest": rel(manifest), "removed_reference": removed.get("source_reference", ""), "new_end": rows[index].get("end", "")}
 
 def split_manifest_shot(manifest_text: str, index: int, seconds: float | None = None) -> dict[str, str]:
@@ -628,7 +621,7 @@ def split_manifest_shot(manifest_text: str, index: int, seconds: float | None = 
     rows[index] = first
     rows.insert(index + 1, second)
     write_manifest_details(manifest, source_video, fieldnames, rows)
-    APP.log.append(f"Split shot {index + 1} at {format_timecode(split_at)}")
+    app_context.APP.log.append(f"Split shot {index + 1} at {format_timecode(split_at)}")
     return {"manifest": rel(manifest), "split": format_timecode(split_at)}
 
 def update_shot_boundary(manifest_text: str, index: int, edge: str, seconds: float) -> dict[str, str]:
@@ -652,7 +645,7 @@ def update_shot_boundary(manifest_text: str, index: int, edge: str, seconds: flo
     else:
         raise RuntimeError("Boundary edge must be start or end.")
     write_manifest_details(manifest, source_video, fieldnames, rows)
-    APP.log.append(f"Updated shot {index + 1} {edge} boundary to {format_timecode(seconds)}")
+    app_context.APP.log.append(f"Updated shot {index + 1} {edge} boundary to {format_timecode(seconds)}")
     return {"manifest": rel(manifest), "time": format_timecode(seconds)}
 
 def update_shot_fade(manifest_text: str, index: int, enabled: bool, crossfade_seconds: str) -> dict[str, str]:
@@ -671,5 +664,5 @@ def update_shot_fade(manifest_text: str, index: int, enabled: bool, crossfade_se
     rows[index]["crossfade_seconds"] = f"{seconds:.3f}".rstrip("0").rstrip(".") if seconds else ""
     write_manifest_details(manifest, source_video, fieldnames, rows)
     state = "enabled" if rows[index]["fade_to_next"] == "true" else "disabled"
-    APP.log.append(f"Fade transition after shot {index + 1} {state}; crossfade {rows[index].get('crossfade_seconds') or '0'}s")
+    app_context.APP.log.append(f"Fade transition after shot {index + 1} {state}; crossfade {rows[index].get('crossfade_seconds') or '0'}s")
     return {"manifest": rel(manifest), "fade_to_next": rows[index]["fade_to_next"], "crossfade_seconds": rows[index]["crossfade_seconds"]}

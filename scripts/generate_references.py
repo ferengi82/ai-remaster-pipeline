@@ -1,16 +1,28 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse, csv
+import argparse
+import csv
+import math
 from dataclasses import dataclass
 from pathlib import Path
 import cv2
 import numpy as np
-from common import ROOT, file_fingerprint, format_time, resolve_path, root_relative, safe_stem, resumable_output, write_signature
+from common import (
+    ROOT,
+    file_fingerprint,
+    format_time,
+    resolve_path,
+    root_relative,
+    safe_stem,
+    resumable_output,
+    write_signature,
+)
 
-DEFAULT_REFERENCE_ROOT = ROOT / 'intermediate' / 'outpainted_references'
-DEFAULT_COLOR_REFERENCE_ROOT = ROOT / 'intermediate' / 'outpainted_references_color'
-DEFAULT_MANIFEST_ROOT = ROOT / 'manifests' / 'references'
+DEFAULT_REFERENCE_ROOT = ROOT / "intermediate" / "outpainted_references"
+DEFAULT_COLOR_REFERENCE_ROOT = ROOT / "intermediate" / "outpainted_references_color"
+DEFAULT_MANIFEST_ROOT = ROOT / "manifests" / "references"
+
 
 @dataclass
 class VideoInfo:
@@ -57,15 +69,16 @@ class ReferenceRow:
 def probe_video(path: Path) -> VideoInfo:
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
-        raise RuntimeError(f'Could not open video: {path}')
+        raise RuntimeError(f"Could not open video: {path}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     cap.release()
     if frame_count <= 0 or width <= 0 or height <= 0:
-        raise RuntimeError(f'Could not read video metadata: {path}')
+        raise RuntimeError(f"Could not read video metadata: {path}")
     return VideoInfo(width, height, fps, frame_count, frame_count / fps)
+
 
 def frame_hist(gray):
     hist = cv2.calcHist([gray], [0], None, [32], [0, 256])
@@ -91,7 +104,9 @@ def dhash(gray):
 
 
 def hist_distance(a, b):
-    corr = cv2.compareHist(a.astype(np.float32), b.astype(np.float32), cv2.HISTCMP_CORREL)
+    corr = cv2.compareHist(
+        a.astype(np.float32), b.astype(np.float32), cv2.HISTCMP_CORREL
+    )
     return 1.0 if np.isnan(corr) else float(max(0, min(2, 1 - corr)))
 
 
@@ -123,8 +138,10 @@ def analyze_frame(frame, idx, fps):
 def analyze_image(path: Path) -> Sample:
     frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if frame is None:
-        raise RuntimeError(f'Could not read image: {path}')
+        raise RuntimeError(f"Could not read image: {path}")
     return analyze_frame(frame, 0, 1.0)
+
+
 def transition_score(a, b):
     return (
         0.28 * hist_distance(a.color_hist, b.color_hist)
@@ -150,14 +167,22 @@ def reuse_similarity_score(a, b):
 
 
 def is_fade(sample, args):
-    return sample.black_ratio >= args.fade_black_ratio or sample.mean_luma <= args.fade_luma
+    return (
+        sample.black_ratio >= args.fade_black_ratio
+        or sample.mean_luma <= args.fade_luma
+    )
 
 
 def near(boundaries, frame, gap):
     return any(abs(frame - boundary) < gap for boundary in boundaries)
 
+
 def sample_video(path, info, args):
-    step = 1 if args.sample_seconds <= 0 else max(1, int(round(args.sample_seconds * info.fps)))
+    step = (
+        1
+        if args.sample_seconds <= 0
+        else max(1, int(round(args.sample_seconds * info.fps)))
+    )
     cap = cv2.VideoCapture(str(path))
     out = []
     idx = 0
@@ -170,36 +195,51 @@ def sample_video(path, info, args):
         idx += 1
     cap.release()
     if not out:
-        raise RuntimeError(f'No frames sampled from {path}')
+        raise RuntimeError(f"No frames sampled from {path}")
     return out
 
 
 def dissolve_score(samples, i, window):
     before = max(0, i - window)
     after = min(len(samples) - 1, i + window)
-    return 0.0 if before == i or after == i else transition_score(samples[before], samples[after])
+    return (
+        0.0
+        if before == i or after == i
+        else transition_score(samples[before], samples[after])
+    )
 
 
 def refine_boundary(samples, start, end):
     if end <= start:
         return samples[end].frame
-    strongest_index = max(range(start + 1, end + 1), key=lambda i: transition_score(samples[i - 1], samples[i]))
+    strongest_index = max(
+        range(start + 1, end + 1),
+        key=lambda i: transition_score(samples[i - 1], samples[i]),
+    )
     return samples[strongest_index].frame
+
 
 def detect_shots(samples, info, args):
     min_frames = max(1, int(round(args.min_shot_seconds * info.fps)))
     dedupe = max(1, int(round(args.boundary_dedupe_seconds * info.fps)))
     dissolve_window = max(1, int(round(args.dissolve_window_seconds * info.fps)))
     dissolve_gap = max(min_frames, int(round(args.dissolve_min_gap_seconds * info.fps)))
-    scores = [0.0] + [transition_score(samples[i - 1], samples[i]) for i in range(1, len(samples))]
+    scores = [0.0] + [
+        transition_score(samples[i - 1], samples[i]) for i in range(1, len(samples))
+    ]
     nz = np.array([score for score in scores[1:] if score > 0], dtype=np.float32)
     if nz.size:
         median = float(np.median(nz))
         mad = float(np.median(np.abs(nz - median)))
-        threshold = max(args.shot_threshold, median + args.dynamic_threshold_scale * max(mad * 1.4826, 0.001))
+        threshold = max(
+            args.shot_threshold,
+            median + args.dynamic_threshold_scale * max(mad * 1.4826, 0.001),
+        )
     else:
         threshold = args.shot_threshold
-    dissolve_scores = [dissolve_score(samples, i, dissolve_window) for i in range(len(samples))]
+    dissolve_scores = [
+        dissolve_score(samples, i, dissolve_window) for i in range(len(samples))
+    ]
     boundaries = [0]
     last = 0
     anchor = samples[0]
@@ -229,7 +269,9 @@ def detect_shots(samples, info, args):
         previous_dissolve = dissolve_scores[i - 1] if i > 1 else 0.0
         next_dissolve = dissolve_scores[i + 1] if i + 1 < len(dissolve_scores) else 0.0
         dissolve_peak = dissolve >= previous_dissolve and dissolve >= next_dissolve
-        hard = (local_peak and adjacent >= threshold and peak_margin >= args.peak_margin) or adjacent >= threshold * 1.8
+        hard = (
+            local_peak and adjacent >= threshold and peak_margin >= args.peak_margin
+        ) or adjacent >= threshold * 1.8
         gradual = (
             args.anchor_threshold > 0
             and cur.frame - last >= int(round(args.anchor_min_seconds * info.fps))
@@ -253,142 +295,363 @@ def detect_shots(samples, info, args):
             else:
                 boundary = refine_boundary(samples, max(0, i - 3), i)
                 this_dedupe = dedupe
-            if boundary - last >= min_frames and not near(boundaries, boundary, this_dedupe):
+            if boundary - last >= min_frames and not near(
+                boundaries, boundary, this_dedupe
+            ):
                 boundaries.append(boundary)
                 last = boundary
                 anchor = cur
                 fade_start = None
     boundaries.append(info.frame_count)
     return [
-        Shot(idx, start, end, [sample for sample in samples if start <= sample.frame < end])
+        Shot(
+            idx,
+            start,
+            end,
+            [sample for sample in samples if start <= sample.frame < end],
+        )
         for idx, (start, end) in enumerate(zip(boundaries, boundaries[1:]))
     ]
 
-def representative_sample(samples,start,end,fps):
-    usable=[s for s in samples if s.black_ratio<0.82 and 14<=s.mean_luma<=242]; candidates=usable or samples
-    if not candidates:
-        gray=np.full((90,160),128,dtype=np.uint8); frame=(start+end)//2; return Sample(frame,frame/fps,128,0,0,frame_hist(gray),np.zeros(24*16,dtype=np.float32),edge_hist(gray),dhash(gray),gray)
-    midpoint=(start+end)/2; max_sharp=max(s.sharpness for s in candidates) or 1.0
-    return max(candidates,key=lambda s:(s.sharpness/max_sharp)-1.8*s.black_ratio-.35*abs(s.mean_luma-92)/255-.65*abs(s.frame-midpoint)/max(1,end-start))
-def read_frame(path,frame_index):
-    cap=cv2.VideoCapture(str(path)); cap.set(cv2.CAP_PROP_POS_FRAMES,max(0,frame_index)); ok,frame=cap.read(); cap.release()
-    if not ok: raise RuntimeError(f'Could not read frame {frame_index} from {path}')
-    return frame
-def write_png(path,frame):
-    path.parent.mkdir(parents=True,exist_ok=True)
-    if not cv2.imwrite(str(path),frame): raise RuntimeError(f'Could not write image: {path}')
 
-def existing_color_candidates(color_root,bw_root):
-    out=[]
-    if not color_root.exists() or not bw_root.exists(): return out
-    for source in bw_root.rglob('*.png'):
-        rel=source.relative_to(bw_root); color=color_root/rel
-        if color.exists():
-            try: out.append((color,analyze_image(source)))
-            except RuntimeError: pass
+def representative_sample(samples, start, end, fps):
+    """Pick the sample that best represents a shot: sharp, well-exposed, near the middle."""
+    usable = [s for s in samples if s.black_ratio < 0.82 and 14 <= s.mean_luma <= 242]
+    candidates = usable or samples
+    if not candidates:
+        gray = np.full((90, 160), 128, dtype=np.uint8)
+        frame = (start + end) // 2
+        return Sample(
+            frame,
+            frame / fps,
+            128,
+            0,
+            0,
+            frame_hist(gray),
+            np.zeros(24 * 16, dtype=np.float32),
+            edge_hist(gray),
+            dhash(gray),
+            gray,
+        )
+    midpoint = (start + end) / 2
+    max_sharp = max(s.sharpness for s in candidates) or 1.0
+    sharpness_weight = 1.0
+    black_penalty = 1.8
+    exposure_penalty = 0.35  # distance from a comfortable mid-grey (luma 92)
+    offcentre_penalty = 0.65  # distance from the middle of the shot
+
+    def quality(s: Sample) -> float:
+        return (
+            sharpness_weight * (s.sharpness / max_sharp)
+            - black_penalty * s.black_ratio
+            - exposure_penalty * abs(s.mean_luma - 92) / 255
+            - offcentre_penalty * abs(s.frame - midpoint) / max(1, end - start)
+        )
+
+    return max(candidates, key=quality)
+
+
+def read_frame(path, frame_index):
+    cap = cv2.VideoCapture(str(path))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, frame_index))
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        raise RuntimeError(f"Could not read frame {frame_index} from {path}")
+    return frame
+
+
+def write_png(path, frame):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), frame):
+        raise RuntimeError(f"Could not write image: {path}")
+
+
+def existing_color_candidates(color_root, bw_root):
+    out = []
+    if not color_root.exists() or not bw_root.exists():
+        return out
+    for source in bw_root.rglob("*.png"):
+        color = color_root / source.relative_to(bw_root)
+        if not color.exists():
+            continue
+        try:
+            out.append((color, analyze_image(source)))
+        except RuntimeError:
+            pass
     return out
 
-def build_rows(args,source_path,info,shots):
-    clip_id=args.reference_set or safe_stem(source_path.name); src_dir=args.reference_root/clip_id; col_dir=args.color_reference_root/clip_id
-    candidates=existing_color_candidates(args.color_reference_root,args.reference_root) if args.reuse_existing_references else []
-    rows=[]
-    for index,shot in enumerate(shots):
-        selected=representative_sample(shot.samples,shot.start_frame,shot.end_frame,info.fps); name=f"cut_{index:04d}_{format_time(selected.time).replace(':','.')}.png"; src=src_dir/name; color=col_dir/name; reused=None; best=999
-        for cpath,csample in candidates:
-            score=reuse_similarity_score(selected,csample)
-            if score<best: best=score; reused=cpath
-        if reused is not None and best<=args.existing_reuse_threshold: color=reused
-        rows.append(ReferenceRow(index,shot.end_frame,selected.frame,selected.time,src,color,reused if color==reused else None))
-        if args.limit is not None and len(rows)>=args.limit: break
+
+def build_rows(args, source_path, info, shots):
+    clip_id = args.reference_set or safe_stem(source_path.name)
+    src_dir = args.reference_root / clip_id
+    col_dir = args.color_reference_root / clip_id
+    candidates = (
+        existing_color_candidates(args.color_reference_root, args.reference_root)
+        if args.reuse_existing_references
+        else []
+    )
+    rows = []
+    for index, shot in enumerate(shots):
+        selected = representative_sample(
+            shot.samples, shot.start_frame, shot.end_frame, info.fps
+        )
+        name = f"cut_{index:04d}_{format_time(selected.time).replace(':', '.')}.png"
+        src = src_dir / name
+        color = col_dir / name
+        reused = None
+        best = math.inf
+        for candidate_path, candidate_sample in candidates:
+            score = reuse_similarity_score(selected, candidate_sample)
+            if score < best:
+                best = score
+                reused = candidate_path
+        if reused is not None and best <= args.existing_reuse_threshold:
+            color = reused
+        rows.append(
+            ReferenceRow(
+                index,
+                shot.end_frame,
+                selected.frame,
+                selected.time,
+                src,
+                color,
+                reused if color == reused else None,
+            )
+        )
+        if args.limit is not None and len(rows) >= args.limit:
+            break
     return rows
 
-def write_manifest(path,source_path,rows,info):
-    path.parent.mkdir(parents=True,exist_ok=True); tmp=path.with_suffix(path.suffix+'.tmp')
-    with tmp.open('w',encoding='utf-8',newline='') as h:
-        h.write(f'# source_video={root_relative(source_path)}\n'); w=csv.writer(h,lineterminator='\n'); w.writerow(['enabled','end','source_reference','color_reference','prompt','fade_to_next','crossfade_seconds'])
-        for row in rows: w.writerow(['true',format_time(min(row.end_frame/info.fps,info.duration)),root_relative(row.source_reference),root_relative(row.color_reference),'','false',''])
+
+def write_manifest(path, source_path, rows, info):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(f"# source_video={root_relative(source_path)}\n")
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(
+            [
+                "enabled",
+                "end",
+                "source_reference",
+                "color_reference",
+                "prompt",
+                "fade_to_next",
+                "crossfade_seconds",
+            ]
+        )
+        for row in rows:
+            writer.writerow(
+                [
+                    "true",
+                    format_time(min(row.end_frame / info.fps, info.duration)),
+                    root_relative(row.source_reference),
+                    root_relative(row.color_reference),
+                    "",
+                    "false",
+                    "",
+                ]
+            )
     tmp.replace(path)
-def source_signature(source_path,row,out_w=0,out_h=0): return {'version':2,'source_video':root_relative(source_path),'source_fingerprint':file_fingerprint(source_path),'selected_frame':row.selected_frame,'selected_time':row.selected_time,'output_width':out_w or 0,'output_height':out_h or 0,'generator':'generate_references.py'}
-def extract_frames(args,source_path,info,rows):
-    out_w=int(args.frame_width or 0); out_h=int(args.frame_height or 0)
-    write_w=out_w or info.width; write_h=out_h or info.height
-    expected={row.source_reference for row in rows}
+
+
+def source_signature(source_path, row, out_w=0, out_h=0):
+    return {
+        "version": 2,
+        "source_video": root_relative(source_path),
+        "source_fingerprint": file_fingerprint(source_path),
+        "selected_frame": row.selected_frame,
+        "selected_time": row.selected_time,
+        "output_width": out_w or 0,
+        "output_height": out_h or 0,
+        "generator": "generate_references.py",
+    }
+
+
+def extract_frames(args, source_path, info, rows):
+    out_w = int(args.frame_width or 0)
+    out_h = int(args.frame_height or 0)
+    write_w = out_w or info.width
+    write_h = out_h or info.height
+    expected = {row.source_reference for row in rows}
     if args.prune_source_frames:
         for folder in {p.parent for p in expected}:
-            if folder.exists():
-                for png in folder.glob('cut_*.png'):
-                    if png not in expected: png.unlink(missing_ok=True); png.with_suffix(png.suffix+'.sig.json').unlink(missing_ok=True); print(f'Removed orphan source frame: {png}')
+            if not folder.exists():
+                continue
+            for png in folder.glob("cut_*.png"):
+                if png in expected:
+                    continue
+                png.unlink(missing_ok=True)
+                png.with_suffix(png.suffix + ".sig.json").unlink(missing_ok=True)
+                print(f"Removed orphan source frame: {png}")
+    rewrite_all = args.force or args.regenerate_source_frames
     for row in rows:
-        sig=source_signature(source_path,row,out_w,out_h)
-        if not args.force and not args.regenerate_source_frames and resumable_output(row.source_reference,sig,width=write_w,height=write_h): print(f'Reuse source frame {row.index:04d}: {row.source_reference}'); continue
-        if not args.force and row.source_reference.exists() and resumable_output(row.source_reference,sig,width=write_w,height=write_h): print(f'Reuse source frame {row.index:04d}: {row.source_reference}'); continue
-        frame=read_frame(source_path,row.selected_frame)
-        if out_w and out_h and (frame.shape[1]!=out_w or frame.shape[0]!=out_h):
-            frame=cv2.resize(frame,(out_w,out_h),interpolation=cv2.INTER_LANCZOS4)
-        write_png(row.source_reference,frame); write_signature(row.source_reference,sig); print(f'Wrote source frame {row.index:04d} ({write_w}x{write_h}): {row.source_reference}')
-def default_manifest_path(source_path): return DEFAULT_MANIFEST_ROOT/f'colorize_manifest_{safe_stem(source_path.name)}_shots_auto.csv'
+        sig = source_signature(source_path, row, out_w, out_h)
+        # A matching signature means the source content, selected frame, and output size are all
+        # unchanged, so the frame on disk is byte-equivalent to what a rewrite would produce.
+        if not rewrite_all and resumable_output(
+            row.source_reference, sig, width=write_w, height=write_h
+        ):
+            print(f"Reuse source frame {row.index:04d}: {row.source_reference}")
+            continue
+        frame = read_frame(source_path, row.selected_frame)
+        if out_w and out_h and (frame.shape[1] != out_w or frame.shape[0] != out_h):
+            frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+        write_png(row.source_reference, frame)
+        write_signature(row.source_reference, sig)
+        print(
+            f"Wrote source frame {row.index:04d} ({write_w}x{write_h}): {row.source_reference}"
+        )
+
+
+def default_manifest_path(source_path):
+    return (
+        DEFAULT_MANIFEST_ROOT
+        / f"colorize_manifest_{safe_stem(source_path.name)}_shots_auto.csv"
+    )
 
 
 def build_parser():
-    parser=argparse.ArgumentParser(description='Detect cuts in an outpainted clip and write reference-image manifests.')
-    parser.add_argument('--source-video',required=True,help='Video to analyse. Relative paths are resolved from the repo root.')
-    parser.add_argument('--output-manifest',type=Path,help='Manifest to write. Defaults to manifests/references/colorize_manifest_<video>_shots_auto.csv')
-    parser.add_argument('--reference-root',type=Path,default=DEFAULT_REFERENCE_ROOT,help='Root for extracted black-and-white reference frames.')
-    parser.add_argument('--color-reference-root',type=Path,default=DEFAULT_COLOR_REFERENCE_ROOT,help='Root for colorized reference frames.')
-    parser.add_argument('--reference-set',help='Folder name under the reference roots. Defaults to the source-video stem.')
-    parser.add_argument('--sample-seconds',type=float,default=0.0,help='Analysis interval. 0 means every frame.')
-    parser.add_argument('--shot-threshold',type=float,default=0.075)
-    parser.add_argument('--dynamic-threshold-scale',type=float,default=2.4)
-    parser.add_argument('--peak-margin',type=float,default=0.01)
-    parser.add_argument('--anchor-threshold',type=float,default=0.50)
-    parser.add_argument('--anchor-min-seconds',type=float,default=8.0)
-    parser.add_argument('--anchor-adjacent-floor',type=float,default=0.004)
-    parser.add_argument('--dissolve-threshold',type=float,default=0.20)
-    parser.add_argument('--dissolve-window-seconds',type=float,default=1.5)
-    parser.add_argument('--dissolve-min-gap-seconds',type=float,default=4.0)
-    parser.add_argument('--boundary-dedupe-seconds',type=float,default=1.5)
-    parser.add_argument('--min-shot-seconds',type=float,default=1.0)
-    parser.add_argument('--fade-black-ratio',type=float,default=0.72)
-    parser.add_argument('--fade-luma',type=float,default=18.0)
-    parser.add_argument('--reuse-existing-references',dest='reuse_existing_references',action='store_true',default=True,help='Reuse existing color references by source-frame similarity.')
-    parser.add_argument('--no-reuse-existing-references',dest='reuse_existing_references',action='store_false')
-    parser.add_argument('--existing-reuse-threshold',type=float,default=0.025)
-    parser.add_argument('--regenerate-source-frames',dest='regenerate_source_frames',action='store_true',default=True,help='Rewrite source screenshots by default so stale cut data is flushed out.')
-    parser.add_argument('--keep-existing-source-frames',dest='regenerate_source_frames',action='store_false')
-    parser.add_argument('--no-prune-source-frames',dest='prune_source_frames',action='store_false',default=True)
-    parser.add_argument('--frame-width',type=int,default=0,help='Resize extracted reference frames to this width (e.g. delivery width to correct model-safe LTX output).')
-    parser.add_argument('--frame-height',type=int,default=0,help='Resize extracted reference frames to this height (e.g. delivery height to correct model-safe LTX output).')
-    parser.add_argument('--limit',type=int,help='Limit rows for smoke tests.')
-    parser.add_argument('--dry-run',action='store_true')
-    parser.add_argument('--force',action='store_true')
+    parser = argparse.ArgumentParser(
+        description="Detect cuts in an outpainted clip and write reference-image manifests."
+    )
+    parser.add_argument(
+        "--source-video",
+        required=True,
+        help="Video to analyse. Relative paths are resolved from the repo root.",
+    )
+    parser.add_argument(
+        "--output-manifest",
+        type=Path,
+        help="Manifest to write. Defaults to manifests/references/colorize_manifest_<video>_shots_auto.csv",
+    )
+    parser.add_argument(
+        "--reference-root",
+        type=Path,
+        default=DEFAULT_REFERENCE_ROOT,
+        help="Root for extracted black-and-white reference frames.",
+    )
+    parser.add_argument(
+        "--color-reference-root",
+        type=Path,
+        default=DEFAULT_COLOR_REFERENCE_ROOT,
+        help="Root for colorized reference frames.",
+    )
+    parser.add_argument(
+        "--reference-set",
+        help="Folder name under the reference roots. Defaults to the source-video stem.",
+    )
+    parser.add_argument(
+        "--sample-seconds",
+        type=float,
+        default=0.0,
+        help="Analysis interval. 0 means every frame.",
+    )
+    parser.add_argument("--shot-threshold", type=float, default=0.075)
+    parser.add_argument("--dynamic-threshold-scale", type=float, default=2.4)
+    parser.add_argument("--peak-margin", type=float, default=0.01)
+    parser.add_argument("--anchor-threshold", type=float, default=0.50)
+    parser.add_argument("--anchor-min-seconds", type=float, default=8.0)
+    parser.add_argument("--anchor-adjacent-floor", type=float, default=0.004)
+    parser.add_argument("--dissolve-threshold", type=float, default=0.20)
+    parser.add_argument("--dissolve-window-seconds", type=float, default=1.5)
+    parser.add_argument("--dissolve-min-gap-seconds", type=float, default=4.0)
+    parser.add_argument("--boundary-dedupe-seconds", type=float, default=1.5)
+    parser.add_argument("--min-shot-seconds", type=float, default=1.0)
+    parser.add_argument("--fade-black-ratio", type=float, default=0.72)
+    parser.add_argument("--fade-luma", type=float, default=18.0)
+    parser.add_argument(
+        "--reuse-existing-references",
+        dest="reuse_existing_references",
+        action="store_true",
+        default=True,
+        help="Reuse existing color references by source-frame similarity.",
+    )
+    parser.add_argument(
+        "--no-reuse-existing-references",
+        dest="reuse_existing_references",
+        action="store_false",
+    )
+    parser.add_argument("--existing-reuse-threshold", type=float, default=0.025)
+    parser.add_argument(
+        "--regenerate-source-frames",
+        dest="regenerate_source_frames",
+        action="store_true",
+        default=False,
+        help="Rewrite all source screenshots even when their resume signatures still match.",
+    )
+    parser.add_argument(
+        "--keep-existing-source-frames",
+        dest="regenerate_source_frames",
+        action="store_false",
+        help="Reuse source screenshots whose resume signatures match (the default).",
+    )
+    parser.add_argument(
+        "--no-prune-source-frames",
+        dest="prune_source_frames",
+        action="store_false",
+        default=True,
+    )
+    parser.add_argument(
+        "--frame-width",
+        type=int,
+        default=0,
+        help="Resize extracted reference frames to this width (e.g. delivery width to correct model-safe LTX output).",
+    )
+    parser.add_argument(
+        "--frame-height",
+        type=int,
+        default=0,
+        help="Resize extracted reference frames to this height (e.g. delivery height to correct model-safe LTX output).",
+    )
+    parser.add_argument("--limit", type=int, help="Limit rows for smoke tests.")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--force", action="store_true")
     return parser
 
+
 def main():
-    args=build_parser().parse_args()
-    source_path=resolve_path(args.source_video)
+    args = build_parser().parse_args()
+    source_path = resolve_path(args.source_video)
     if not source_path.exists():
-        raise FileNotFoundError(f'Source video not found: {source_path}')
-    args.reference_root=resolve_path(args.reference_root)
-    args.color_reference_root=resolve_path(args.color_reference_root)
-    manifest=resolve_path(args.output_manifest) if args.output_manifest else default_manifest_path(source_path)
-    info=probe_video(source_path)
-    samples=sample_video(source_path,info,args)
-    shots=detect_shots(samples,info,args)
-    rows=build_rows(args,source_path,info,shots)
-    reused=sum(1 for row in rows if row.reused_color_from)
-    print(f'Source: {source_path}')
-    print(f'Video: {info.width}x{info.height}, {info.fps:.6g} fps, {info.frame_count} frames, {format_time(info.duration)}')
-    print(f'Detected {len(shots)} cut spans; writing {len(rows)} manifest rows, {len(rows)-reused} unique/new reference targets, {reused} reused.')
+        raise FileNotFoundError(f"Source video not found: {source_path}")
+    args.reference_root = resolve_path(args.reference_root)
+    args.color_reference_root = resolve_path(args.color_reference_root)
+    manifest = (
+        resolve_path(args.output_manifest)
+        if args.output_manifest
+        else default_manifest_path(source_path)
+    )
+    info = probe_video(source_path)
+    samples = sample_video(source_path, info, args)
+    shots = detect_shots(samples, info, args)
+    rows = build_rows(args, source_path, info, shots)
+    reused = sum(1 for row in rows if row.reused_color_from)
+    print(f"Source: {source_path}")
+    print(
+        f"Video: {info.width}x{info.height}, {info.fps:.6g} fps, {info.frame_count} frames, {format_time(info.duration)}"
+    )
+    print(
+        f"Detected {len(shots)} cut spans; writing {len(rows)} manifest rows, {len(rows) - reused} unique/new reference targets, {reused} reused."
+    )
     for row in rows:
-        note=f' reuse={root_relative(row.reused_color_from)}' if row.reused_color_from else ''
-        print(f'cut {row.index:04d} selected={format_time(row.selected_time)} end={format_time(row.end_frame/info.fps)} ref={root_relative(row.color_reference)}{note}')
+        note = (
+            f" reuse={root_relative(row.reused_color_from)}"
+            if row.reused_color_from
+            else ""
+        )
+        print(
+            f"cut {row.index:04d} selected={format_time(row.selected_time)} end={format_time(row.end_frame / info.fps)} ref={root_relative(row.color_reference)}{note}"
+        )
     if args.dry_run:
-        print(f'Dry run; would write {manifest}')
+        print(f"Dry run; would write {manifest}")
         return 0
-    extract_frames(args,source_path,info,rows)
-    write_manifest(manifest,source_path,rows,info)
-    print(f'Wrote manifest: {manifest}')
+    extract_frames(args, source_path, info, rows)
+    write_manifest(manifest, source_path, rows, info)
+    print(f"Wrote manifest: {manifest}")
     return 0
 
-if __name__=='__main__':
+
+if __name__ == "__main__":
     raise SystemExit(main())

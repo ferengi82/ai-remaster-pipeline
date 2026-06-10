@@ -7,19 +7,29 @@ import sys
 import time
 from pathlib import Path
 
-from .config import IMAGE_EXTS, QWEN_IMAGE_EDIT_MODEL, ROOT, SCRIPTS
+from . import app_context
+from .artifacts import (
+    outpaint_chunk_dir_for,
+    outpaint_chunk_manifest_for,
+    outpaint_chunk_offset_slug,
+    outpaint_prepared_for,
+    outpaint_size_for_source,
+    outpaint_work_size_for_source,
+)
+from .config import FILE_PREVIEW_DIR, IMAGE_EXTS, OUTPAINT_PROMPT, QWEN_IMAGE_EDIT_MODEL, ROOT, SCRIPTS, current_config
+from .file_dialogs import browse_path
 from .manifests import read_outpaint_chunk_rows, write_outpaint_chunk_rows
-from .media import extract_video_frame_at
+from .media import aspect_preview_at, ensure_source_section_clip, extract_video_frame_at, pipeline_source_text, video_metrics
 from .paths import rel, resolve, resolve_video_source
+from .process_utils import format_timecode
+from .runtime_settings import qwen_masked_workflow_for
 from .sam_masks import sam2_mask_for_image
 
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
+import artifact_ids as aid  # noqa: E402
 from guide_frame_utils import guide_output_size_for_prepared, save_edge_mask_for_image  # noqa: E402
 
-
-def bind_context(context: dict) -> None:
-    globals().update(context)
 
 
 def chunk_frame_preview(source: Path, seconds: float, suffix: str) -> str:
@@ -90,12 +100,6 @@ def _build_guide_frames_view(
         image_rel = gf.get("image", "")
         image_path = resolve(image_rel) if image_rel else None
         image_exists = bool(image_path and image_path.exists())
-        source_secs = _guide_source_seconds(
-            {"start": start_seconds, "end": end_seconds,
-             "start_frame": str(int(start_seconds * fps)),
-             "end_frame": str(int(end_seconds * fps))},
-            frame_idx, fps,
-        )
         view.append({
             "guide_index": i,
             "frame_idx": frame_idx,
@@ -109,7 +113,7 @@ def _build_guide_frames_view(
 
 def guide_frame_generation_command(chunk_index: int, guide_index: int, frame_idx: int, prompt: str) -> tuple[list[str], str, Path, float]:
     """Build the Qwen generation command for any guide frame position."""
-    state = outpaint_chunks_state(APP.settings)
+    state = outpaint_chunks_state(app_context.APP.settings, sync=True)
     rows = state.get("rows", [])
     manifest_text = state.get("manifest", "")
     if not manifest_text:
@@ -121,10 +125,10 @@ def guide_frame_generation_command(chunk_index: int, guide_index: int, frame_idx
     fps = float(row.get("fps", 24) or 24)
     source_seconds = _guide_source_seconds(row, frame_idx, fps)
 
-    source_text = pipeline_source_text(APP.settings)
+    source_text = pipeline_source_text(app_context.APP.settings)
     if not source_text:
         raise RuntimeError("No source material is selected.")
-    range_source = ensure_outpaint_prepared_canvas(source_text, APP.settings.get("outpaint", {}))
+    range_source = ensure_outpaint_prepared_canvas(source_text, app_context.APP.settings.get("outpaint", {}))
     cache_key = f"gf_qwen_{int(source_seconds * 1000):010d}"
     preview_rel = chunk_frame_preview(range_source, source_seconds, cache_key)
     source_img = resolve(preview_rel) if preview_rel else Path("")
@@ -248,7 +252,7 @@ def save_qwen_input_copy(source: Path, target: Path) -> Path:
     return target
 
 def auto_masked_guide_command(source: Path, output: Path, prompt: str, mask: Path) -> list[str]:
-    values = APP.settings.get("references", {})
+    values = app_context.APP.settings.get("references", {})
     config = current_config()
     workflow = qwen_masked_workflow_for(values, config)
     if not workflow:
@@ -278,7 +282,7 @@ def auto_masked_guide_command(source: Path, output: Path, prompt: str, mask: Pat
     return cmd
 
 def outpaint_guide_generation_command(index: int, prompt: str) -> tuple[list[str], str, Path]:
-    state = outpaint_chunks_state(APP.settings)
+    state = outpaint_chunks_state(app_context.APP.settings, sync=True)
     rows = state.get("rows", [])
     manifest_text = state.get("manifest", "")
     if not manifest_text:
@@ -287,13 +291,12 @@ def outpaint_guide_generation_command(index: int, prompt: str) -> tuple[list[str
         raise IndexError(f"Outpaint chunk not found: {index + 1}")
 
     row = rows[index]
-    fps = float(row.get("fps", 24) or 24)
     start_seconds = float(row.get("start", 0.0))
     guide_source_seconds = start_seconds
-    source_text = pipeline_source_text(APP.settings)
+    source_text = pipeline_source_text(app_context.APP.settings)
     if not source_text:
         raise RuntimeError("No source material is selected.")
-    range_source = ensure_outpaint_prepared_canvas(source_text, APP.settings.get("outpaint", {}))
+    range_source = ensure_outpaint_prepared_canvas(source_text, app_context.APP.settings.get("outpaint", {}))
     preview_rel = chunk_frame_preview(range_source, guide_source_seconds, "source_guide_qwen")
     source = resolve(preview_rel) if preview_rel else Path("")
     if not source.is_file():
@@ -318,7 +321,7 @@ def outpaint_guide_generation_command(index: int, prompt: str) -> tuple[list[str
     return cmd, rel(output), resolve(range_source), guide_source_seconds
 
 def outpaint_end_guide_generation_command(index: int, prompt: str) -> tuple[list[str], str, Path, float]:
-    state = outpaint_chunks_state(APP.settings)
+    state = outpaint_chunks_state(app_context.APP.settings, sync=True)
     rows = state.get("rows", [])
     manifest_text = state.get("manifest", "")
     if not manifest_text:
@@ -331,10 +334,10 @@ def outpaint_end_guide_generation_command(index: int, prompt: str) -> tuple[list
     end_seconds = float(row.get("end", 0.0))
     # Use the last meaningful frame (end - 1/fps) as the Qwen source for the end guide.
     guide_source_seconds = max(float(row.get("start", 0.0)), end_seconds - (1.0 / max(1.0, fps)))
-    source_text = pipeline_source_text(APP.settings)
+    source_text = pipeline_source_text(app_context.APP.settings)
     if not source_text:
         raise RuntimeError("No source material is selected.")
-    range_source = ensure_outpaint_prepared_canvas(source_text, APP.settings.get("outpaint", {}))
+    range_source = ensure_outpaint_prepared_canvas(source_text, app_context.APP.settings.get("outpaint", {}))
     preview_rel = chunk_frame_preview(range_source, guide_source_seconds, "source_guide_end_qwen")
     source = resolve(preview_rel) if preview_rel else Path("")
     if not source.is_file():
@@ -360,7 +363,7 @@ def outpaint_end_guide_generation_command(index: int, prompt: str) -> tuple[list
 
 
 def _get_guide_manifest() -> tuple[Path, dict[int, dict[str, str]], str]:
-    state = outpaint_chunks_state(APP.settings)
+    state = outpaint_chunks_state(app_context.APP.settings, sync=True)
     manifest_text = state.get("manifest", "")
     if not manifest_text:
         raise RuntimeError("No outpaint chunk manifest is available yet.")
@@ -375,7 +378,7 @@ def add_guide_frame(chunk_index: int) -> dict:
     frames = _parse_guide_frames(rows[chunk_index])
     frames.append({"frame_idx": 0, "strength": 0.7, "image": ""})
     _save_guide_frames(manifest, chunk_index, frames)
-    APP.log.append(f"Added guide frame to chunk {chunk_index + 1} (total: {len(frames)})")
+    app_context.APP.log.append(f"Added guide frame to chunk {chunk_index + 1} (total: {len(frames)})")
     return {"guide_index": len(frames) - 1}
 
 def remove_guide_frame(chunk_index: int, guide_index: int) -> dict:
@@ -389,7 +392,7 @@ def remove_guide_frame(chunk_index: int, guide_index: int) -> dict:
     if removed.get("image"):
         remove_cached_file(resolve(removed["image"]))
     _save_guide_frames(manifest, chunk_index, frames)
-    APP.log.append(f"Removed guide frame {guide_index} from chunk {chunk_index + 1}")
+    app_context.APP.log.append(f"Removed guide frame {guide_index} from chunk {chunk_index + 1}")
     return {"removed": guide_index}
 
 def save_guide_frame(chunk_index: int, guide_index: int, frame_idx: int, strength: float) -> dict:
@@ -402,7 +405,7 @@ def save_guide_frame(chunk_index: int, guide_index: int, frame_idx: int, strengt
     frames[guide_index]["frame_idx"] = int(frame_idx)
     frames[guide_index]["strength"] = round(max(0.0, min(1.0, float(strength))), 3)
     _save_guide_frames(manifest, chunk_index, frames)
-    APP.log.append(f"Saved guide frame {guide_index} for chunk {chunk_index + 1}: frame_idx={frame_idx}, strength={strength:.2f}")
+    app_context.APP.log.append(f"Saved guide frame {guide_index} for chunk {chunk_index + 1}: frame_idx={frame_idx}, strength={strength:.2f}")
     return {"frame_idx": frame_idx, "strength": frames[guide_index]["strength"]}
 
 def upload_guide_frame_image(chunk_index: int, guide_index: int) -> dict:
@@ -426,7 +429,7 @@ def upload_guide_frame_image(chunk_index: int, guide_index: int) -> dict:
     frames[guide_index]["image"] = rel(target)
     frames[guide_index].pop("seed", None)
     _save_guide_frames(manifest, chunk_index, frames)
-    APP.log.append(f"Uploaded guide frame {guide_index} for chunk {chunk_index + 1}: {rel(target)}")
+    app_context.APP.log.append(f"Uploaded guide frame {guide_index} for chunk {chunk_index + 1}: {rel(target)}")
     return {"selected": selected, "image": rel(target)}
 
 def clear_guide_frame_image(chunk_index: int, guide_index: int) -> dict:
@@ -441,7 +444,7 @@ def clear_guide_frame_image(chunk_index: int, guide_index: int) -> dict:
         remove_cached_file(resolve(current))
     frames[guide_index]["image"] = ""
     _save_guide_frames(manifest, chunk_index, frames)
-    APP.log.append(f"Cleared guide frame {guide_index} image for chunk {chunk_index + 1}")
+    app_context.APP.log.append(f"Cleared guide frame {guide_index} image for chunk {chunk_index + 1}")
     return {"image": ""}
 
 def _guide_edit_dir(manifest: Path, chunk_index: int, guide_index: int) -> Path:
@@ -501,17 +504,17 @@ def _guide_editor_source(chunk_index: int, guide_index: int, frames: list[dict])
     current = frames[guide_index].get("image", "")
     if current and resolve(current).is_file():
         return current, None, None
-    state = outpaint_chunks_state(APP.settings)
+    state = outpaint_chunks_state(app_context.APP.settings)
     rows = state.get("rows", [])
     if chunk_index < 0 or chunk_index >= len(rows):
         raise IndexError(f"Outpaint chunk not found: {chunk_index + 1}")
     row = rows[chunk_index]
     fps = float(row.get("fps", 24) or 24)
     source_seconds = _guide_source_seconds(row, int(frames[guide_index].get("frame_idx", 0)), fps)
-    source_text = pipeline_source_text(APP.settings)
+    source_text = pipeline_source_text(app_context.APP.settings)
     if not source_text:
         raise RuntimeError("No source material is selected.")
-    prepared = ensure_outpaint_prepared_canvas(source_text, APP.settings.get("outpaint", {}))
+    prepared = ensure_outpaint_prepared_canvas(source_text, app_context.APP.settings.get("outpaint", {}))
     preview_rel = chunk_frame_preview(prepared, source_seconds, f"guide_edit_{chunk_index}_{guide_index}")
     if not preview_rel or not resolve(preview_rel).is_file():
         raise FileNotFoundError("Could not prepare a guide image for editing.")
@@ -532,7 +535,7 @@ def guide_edit_preview_command(chunk_index: int, guide_index: int, instruction: 
         mask_path = _guide_edit_dir(manifest, chunk_index, guide_index) / f"mask_edge_{time.strftime('%Y%m%d_%H%M%S')}.png"
         mask = rel(save_edge_mask_for_image(source, mask_path))
     prompt = _guide_edit_prompt(instruction, sampled_color)
-    values = APP.settings.get("references", {})
+    values = app_context.APP.settings.get("references", {})
     config = current_config()
     comfy_dir = config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))
     comfy_url = values.get("comfy_url") or config.get("comfy_url", "http://127.0.0.1:8188")
@@ -608,7 +611,7 @@ def accept_guide_edit(chunk_index: int, guide_index: int, preview_path: str) -> 
     frames[guide_index]["image"] = rel(preview)
     frames[guide_index].pop("seed", None)
     _save_guide_frames(manifest, chunk_index, frames)
-    APP.log.append(f"Accepted edited guide frame {guide_index + 1} for chunk {chunk_index + 1}: {rel(preview)}")
+    app_context.APP.log.append(f"Accepted edited guide frame {guide_index + 1} for chunk {chunk_index + 1}: {rel(preview)}")
     return {"image": rel(preview), "previous": previous}
 
 def revert_guide_edit(chunk_index: int, guide_index: int) -> dict:
@@ -627,5 +630,400 @@ def revert_guide_edit(chunk_index: int, guide_index: int) -> dict:
     frames[guide_index]["image_previous"] = current
     frames[guide_index]["image"] = previous
     _save_guide_frames(manifest, chunk_index, frames)
-    APP.log.append(f"Reverted guide frame {guide_index + 1} for chunk {chunk_index + 1}: {previous}")
+    app_context.APP.log.append(f"Reverted guide frame {guide_index + 1} for chunk {chunk_index + 1}: {previous}")
     return {"image": previous, "previous": current}
+
+
+DEFAULT_ANCHOR_PROMPT = "Replace the black bars."
+
+
+def ensure_outpaint_prepared_canvas(source_text: str, values: dict[str, str]) -> Path:
+    source = resolve_video_source(source_text)
+    prepared = outpaint_prepared_for(source_text, values)
+    if prepared.exists():
+        return prepared
+
+    cmd = [
+        sys.executable,
+        str(SCRIPTS / "prepare_outpaint_input.py"),
+        "--source",
+        str(source),
+        "--target-aspect",
+        values.get("target_aspect", "16:9"),
+        "--black-lift",
+        str(values.get("black_lift", "0.018") or "0.018"),
+        "--gamma",
+        str(values.get("gamma", "1.06") or "1.06"),
+        "--output",
+        str(prepared),
+        "--crop-left",
+        str(values.get("crop_left", "0") or "0"),
+        "--crop-right",
+        str(values.get("crop_right", "0") or "0"),
+        "--crop-top",
+        str(values.get("crop_top", "0") or "0"),
+        "--crop-bottom",
+        str(values.get("crop_bottom", "0") or "0"),
+        "--target-width",
+        str(outpaint_work_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[0]),
+        "--target-height",
+        str(outpaint_work_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[1]),
+        "--delivery-width",
+        str(outpaint_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[0]),
+        "--delivery-height",
+        str(outpaint_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[1]),
+    ]
+    if values.get("outpaint_all_black_regions", "false") == "true":
+        cmd.append("--outpaint-all-black-regions")
+    app_context.APP.log.append(f"Preparing expanded canvas for guide frame: {rel(prepared)}")
+    app_context.APP.log.append("> " + " ".join(cmd))
+    result = subprocess.run(cmd, cwd=ROOT, check=False, capture_output=True, text=True)
+    for line in (result.stdout or "").splitlines():
+        app_context.APP.log.append(line)
+    for line in (result.stderr or "").splitlines():
+        app_context.APP.log.append(line)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr or result.stdout or "Could not prepare expanded outpaint canvas.")
+    if not prepared.exists():
+        raise RuntimeError(f"Prepared expanded canvas was not created: {prepared}")
+    return prepared
+
+
+def outpaint_chunks_state(settings: dict, sync: bool = False) -> dict:
+    """Build the chunk-table view for the Outpainting tab.
+
+    Read-only by default so /api/state polls cannot rewrite the chunk manifest; pass
+    ``sync=True`` from mutating endpoints that need the manifest written to disk before
+    they edit individual rows.
+    """
+    try:
+        ensure_source_section_clip(settings)
+    except Exception as exc:
+        return {"manifest": "", "rows": [], "error": f"Could not prepare selected source section: {exc}"}
+
+    source_text = pipeline_source_text(settings)
+    if not source_text:
+        return {"manifest": "", "rows": []}
+    source = resolve_video_source(source_text)
+    if not source.exists():
+        return {"manifest": "", "rows": [], "error": f"Source material is not a readable file: {source}"}
+    values = settings.get("outpaint", {})
+    metrics = video_metrics(source)
+    fps = metrics.get("fps") or 24.0
+    total_frames = int(metrics.get("frames") or 0)
+    if total_frames <= 0:
+        message = f"Outpaint chunk preview skipped; could not count frames in: {source}"
+        app_context.APP.log.append(message)
+        return {"manifest": "", "rows": [], "error": message}
+    try:
+        chunk_seconds = float(values.get("chunk_seconds", "20") or 20)
+    except ValueError:
+        chunk_seconds = 20.0
+    try:
+        overlap_frames = int(float(values.get("overlap_frames", "8") or 8))
+    except ValueError:
+        overlap_frames = 8
+    chunk_dir = outpaint_chunk_dir_for(source_text, values)
+    manifest = resolve(outpaint_chunk_manifest_for(source_text, values))
+    existing = read_outpaint_chunk_rows(manifest)
+    ranges = outpaint_chunk_ranges(total_frames, fps, chunk_seconds, overlap_frames, existing)
+    global_prompt = values.get("prompt") or OUTPAINT_PROMPT
+    global_negative = values.get("negative_prompt", "")
+    rows = []
+    for index, start_frame, end_frame in ranges:
+        row = dict(existing.get(index, {}))
+        row.setdefault("offset_x", "0")
+        row.setdefault("offset_y", "0")
+        offset_slug = outpaint_chunk_offset_slug(row)
+        prepared = chunk_dir / f"prepared_{index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mp4"
+        raw = chunk_dir / f"raw_{index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mp4"
+        row.update({
+            "chunk_index": str(index),
+            "start_frame": str(start_frame),
+            "end_frame": str(end_frame),
+            "start_seconds": f"{start_frame / fps:.6f}",
+            "end_seconds": f"{end_frame / fps:.6f}",
+            "prepared_path": rel(prepared),
+            "raw_path": rel(raw),
+        })
+        row.setdefault("custom_seconds", "")
+        if not row.get("seed"):
+            row["seed"] = str(42 + index)
+        row.setdefault("prompt_suffix", "")
+        row.setdefault("negative_suffix", "")
+        row.setdefault("guide_image", "")
+        row.setdefault("guide_strength", "0.7")
+        row.setdefault("guide_end_image", "")
+        row.setdefault("guide_end_strength", "1.0")
+        row.setdefault("guide_frames", "")
+        rows.append(row)
+    if sync:
+        write_outpaint_chunk_rows(manifest, rows)
+    view_rows = []
+    for row in rows:
+        raw = resolve(row["raw_path"])
+        prepared = resolve(row["prepared_path"])
+        start_seconds = float(row["start_seconds"])
+        end_seconds = float(row["end_seconds"])
+        length_frames = int(row["end_frame"]) - int(row["start_frame"])
+        aspect = values.get("target_aspect", "16:9")
+        guides = _build_guide_frames_view(row, source_text, aspect, start_seconds, end_seconds, fps, length_frames)
+        view_rows.append(row | {
+            "index": int(row["chunk_index"]),
+            "start": float(row["start_seconds"]),
+            "end": float(row["end_seconds"]),
+            "fps": fps,
+            "total_frames": total_frames,
+            "length_frames": length_frames,
+            "max_length_frames": max(1, total_frames - int(row["start_frame"])),
+            "start_label": format_timecode(float(row["start_seconds"])),
+            "end_label": format_timecode(float(row["end_seconds"])),
+            "raw_exists": raw.exists(),
+            "raw_mtime": int(raw.stat().st_mtime_ns) if raw.exists() else 0,
+            "prepared_exists": prepared.exists(),
+            "guides": guides,
+            "source_start_preview": "",
+            "source_middle_preview": "",
+            "source_end_preview": "",
+            "raw_start_preview": "",
+            "raw_middle_preview": "",
+            "raw_end_preview": "",
+            "effective_prompt": aid.combine_prompt(global_prompt, row.get("prompt_suffix", "")),
+            "effective_negative_prompt": aid.combine_prompt(global_negative, row.get("negative_suffix", "")),
+        })
+    return {"manifest": rel(manifest), "rows": view_rows}
+
+
+def outpaint_chunk_preview(settings: dict, chunk_index: int, kind: str, position: str) -> str:
+    chunks = outpaint_chunks_state(settings)
+    row = next((r for r in chunks.get("rows", []) if int(r.get("index", -1)) == chunk_index), None)
+    if row is None:
+        raise IndexError(f"Outpaint chunk not found: {chunk_index + 1}")
+
+    position = position if position in {"start", "middle", "end"} else "middle"
+    fps = max(1.0, float(row.get("fps", 24) or 24))
+    start_seconds = float(row.get("start", 0.0) or 0.0)
+    end_seconds = float(row.get("end", start_seconds) or start_seconds)
+    duration = max(0.0, end_seconds - start_seconds)
+
+    if position == "start":
+        offset = 0.0
+    elif position == "end":
+        offset = max(0.0, duration - (1.0 / fps))
+    else:
+        offset = duration / 2
+
+    if kind == "raw":
+        raw = resolve(str(row.get("raw_path", "")))
+        if not raw.exists():
+            return ""
+        return chunk_frame_preview(raw, offset, f"raw_{chunk_index}_{position}")
+
+    source_text = pipeline_source_text(settings)
+    if not source_text:
+        return ""
+    aspect = settings.get("outpaint", {}).get("target_aspect", "16:9")
+    try:
+        offset_x = int(float(row.get("offset_x", "0") or 0))
+        offset_y = int(float(row.get("offset_y", "0") or 0))
+    except ValueError:
+        offset_x = offset_y = 0
+    return aspect_preview_at(source_text, aspect, start_seconds + offset, offset_x, offset_y)
+
+
+def outpaint_chunk_ranges(total_frames: int, fps: float, default_seconds: float, overlap_frames: int, existing: dict[int, dict[str, str]]) -> list[tuple[int, int, int]]:
+    ranges = []
+    start = 0
+    index = 0
+    while start < total_frames:
+        seconds = default_seconds
+        custom = existing.get(index, {}).get("custom_seconds", "")
+        if custom:
+            try:
+                seconds = float(custom)
+            except ValueError:
+                seconds = default_seconds
+        chunk_frames = total_frames if seconds <= 0 else max(1, int(round(seconds * fps)))
+        end = min(total_frames, start + chunk_frames)
+        ranges.append((index, start, end))
+        if end >= total_frames:
+            break
+        overlap = max(0, min(overlap_frames, chunk_frames - 1))
+        start += max(1, chunk_frames - overlap)
+        index += 1
+    return ranges
+
+
+def _truthy_payload_value(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str, custom_seconds: str = "", negative_suffix: str = "", guide_strength: str = "", guide_end_strength: str = "", custom_length=None, offset_x: str = "0", offset_y: str = "0") -> None:
+    state = outpaint_chunks_state(app_context.APP.settings, sync=True)
+    manifest_text = state.get("manifest", "")
+    if not manifest_text:
+        raise RuntimeError("No outpaint chunk manifest is available yet.")
+    rows = read_outpaint_chunk_rows(resolve(str(manifest_text)))
+    if index not in rows:
+        raise IndexError(f"Outpaint chunk not found: {index + 1}")
+    row = rows[index]
+    row["seed"] = str(int(float(seed or row.get("seed") or 42 + index)))
+    row["prompt_suffix"] = prompt_suffix
+    row["negative_suffix"] = negative_suffix
+    row["offset_x"] = str(int(float(offset_x or 0)))
+    row["offset_y"] = str(int(float(offset_y or 0)))
+    use_custom_length = _truthy_payload_value(custom_length) if custom_length is not None else bool(custom_seconds)
+    if use_custom_length and custom_seconds:
+        row["custom_seconds"] = f"{max(0.1, float(custom_seconds)):.3f}"
+    else:
+        row["custom_seconds"] = ""
+    if guide_strength:
+        try:
+            row["guide_strength"] = f"{max(0.0, min(1.0, float(guide_strength))):.3f}"
+        except ValueError:
+            pass
+    if guide_end_strength:
+        try:
+            row["guide_end_strength"] = f"{max(0.0, min(1.0, float(guide_end_strength))):.3f}"
+        except ValueError:
+            pass
+    ordered = [rows[key] for key in sorted(rows)]
+    write_outpaint_chunk_rows(resolve(str(manifest_text)), ordered)
+    app_context.APP.log.append(f"Saved outpaint chunk {index + 1}: seed {row['seed']}")
+
+
+def remove_cached_file(path: Path) -> bool:
+    removed = False
+    for candidate in (path, path.with_suffix(path.suffix + ".sig.json"), path.with_suffix(path.suffix + ".partial")):
+        try:
+            if candidate.exists() and candidate.is_file():
+                candidate.unlink()
+                removed = True
+        except PermissionError:
+            app_context.APP.log.append(f"Could not delete cached file because it is open in another process: {rel(candidate)}")
+        except OSError as exc:
+            app_context.APP.log.append(f"Could not delete cached file {rel(candidate)}: {exc}")
+    return removed
+
+
+def clear_cached_guide_frames(manifest: Path, index: int) -> int:
+    guide_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem
+    if not guide_dir.exists():
+        # Also check legacy path name used before the anchorâ†’guide rename.
+        guide_dir = ROOT / "intermediate" / "outpaint_anchors" / manifest.stem
+        if not guide_dir.exists():
+            return 0
+    removed = 0
+    for path in guide_dir.glob(f"chunk_{index:04d}_*"):
+        if path.is_file() and remove_cached_file(path):
+            removed += 1
+    return removed
+
+
+def install_outpaint_guide(index: int) -> dict[str, str]:
+    state = outpaint_chunks_state(app_context.APP.settings, sync=True)
+    manifest_text = state.get("manifest", "")
+    if not manifest_text:
+        raise RuntimeError("No outpaint chunk manifest is available yet.")
+    manifest = resolve(str(manifest_text))
+    rows = read_outpaint_chunk_rows(manifest)
+    if index not in rows:
+        raise IndexError(f"Outpaint chunk not found: {index + 1}")
+
+    current = rows[index].get("guide_image", "")
+    selected = browse_path("image", current)
+    if not selected:
+        return {"selected": "", "guide_image": current}
+
+    source = resolve(selected)
+    if source.suffix.lower() not in IMAGE_EXTS:
+        raise RuntimeError("Choose a PNG or JPEG image for the outpaint guide frame.")
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(source)
+
+    target_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem
+    target = target_dir / f"chunk_{index:04d}_guide{source.suffix.lower()}"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+
+    rows[index]["guide_image"] = rel(target)
+    write_outpaint_chunk_rows(manifest, [rows[key] for key in sorted(rows)])
+    app_context.APP.log.append(f"Installed outpaint guide frame for chunk {index + 1}: {rel(target)}")
+    return {"selected": selected, "guide_image": rel(target)}
+
+
+def clear_outpaint_guide(index: int) -> dict[str, str]:
+    state = outpaint_chunks_state(app_context.APP.settings, sync=True)
+    manifest_text = state.get("manifest", "")
+    if not manifest_text:
+        raise RuntimeError("No outpaint chunk manifest is available yet.")
+    manifest = resolve(str(manifest_text))
+    rows = read_outpaint_chunk_rows(manifest)
+    if index not in rows:
+        raise IndexError(f"Outpaint chunk not found: {index + 1}")
+    removed = clear_cached_guide_frames(manifest, index)
+    rows[index]["guide_image"] = ""
+    if "anchor_image" in rows[index]:
+        rows[index]["anchor_image"] = ""
+    write_outpaint_chunk_rows(manifest, [rows[key] for key in sorted(rows)])
+    suffix = f" and deleted {removed} cached file(s)" if removed else ""
+    app_context.APP.log.append(f"Cleared outpaint guide frame for chunk {index + 1}{suffix}")
+    return {"guide_image": ""}
+
+
+def clear_outpaint_anchor(index: int) -> dict[str, str]:
+    return clear_outpaint_guide(index)
+
+
+def install_outpaint_end_guide(index: int) -> dict[str, str]:
+    state = outpaint_chunks_state(app_context.APP.settings, sync=True)
+    manifest_text = state.get("manifest", "")
+    if not manifest_text:
+        raise RuntimeError("No outpaint chunk manifest is available yet.")
+    manifest = resolve(str(manifest_text))
+    rows = read_outpaint_chunk_rows(manifest)
+    if index not in rows:
+        raise IndexError(f"Outpaint chunk not found: {index + 1}")
+
+    current = rows[index].get("guide_end_image", "")
+    selected = browse_path("image", current)
+    if not selected:
+        return {"selected": "", "guide_end_image": current}
+
+    source = resolve(selected)
+    if source.suffix.lower() not in IMAGE_EXTS:
+        raise RuntimeError("Choose a PNG or JPEG image for the outpaint end guide frame.")
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(source)
+
+    target_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem
+    target = target_dir / f"chunk_{index:04d}_guide_end{source.suffix.lower()}"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+
+    rows[index]["guide_end_image"] = rel(target)
+    write_outpaint_chunk_rows(manifest, [rows[key] for key in sorted(rows)])
+    app_context.APP.log.append(f"Installed outpaint end guide frame for chunk {index + 1}: {rel(target)}")
+    return {"selected": selected, "guide_end_image": rel(target)}
+
+
+def clear_outpaint_end_guide(index: int) -> dict[str, str]:
+    state = outpaint_chunks_state(app_context.APP.settings, sync=True)
+    manifest_text = state.get("manifest", "")
+    if not manifest_text:
+        raise RuntimeError("No outpaint chunk manifest is available yet.")
+    manifest = resolve(str(manifest_text))
+    rows = read_outpaint_chunk_rows(manifest)
+    if index not in rows:
+        raise IndexError(f"Outpaint chunk not found: {index + 1}")
+    # Remove the end guide file if it's in our managed directory.
+    current = rows[index].get("guide_end_image", "")
+    if current:
+        path = resolve(current)
+        remove_cached_file(path)
+    rows[index]["guide_end_image"] = ""
+    write_outpaint_chunk_rows(manifest, [rows[key] for key in sorted(rows)])
+    app_context.APP.log.append(f"Cleared outpaint end guide frame for chunk {index + 1}")
+    return {"guide_end_image": ""}

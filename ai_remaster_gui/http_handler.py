@@ -13,10 +13,45 @@ def bind_context(context: dict) -> None:
     globals().update(context)
 
 
+ALLOWED_HOST_NAMES = {"127.0.0.1", "localhost", "[::1]"}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "AIRemasterGUI/1.0"
 
+    def host_allowed(self) -> bool:
+        """Only answer requests addressed to localhost.
+
+        The server binds to 127.0.0.1, but a malicious web page can still reach it via DNS
+        rebinding (a hostname that resolves to 127.0.0.1 bypasses the browser's same-origin
+        protections). Rejecting foreign Host headers closes that off.
+        """
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host.startswith("["):
+            name = host.split("]", 1)[0] + "]"
+        else:
+            name = host.rsplit(":", 1)[0] if ":" in host else host
+        return name in ALLOWED_HOST_NAMES
+
+    def logfile_allowed(self, path: Path) -> bool:
+        """The log viewer may only read log-like files from ARP itself or the ComfyUI install."""
+        if path.suffix.lower() not in {".log", ".txt"}:
+            return False
+        config = current_config()
+        allowed_roots = [ROOT, Path(config.get("comfy_dir", str(ROOT / "tools" / "comfyui")))]
+        resolved = path.resolve()
+        for root in allowed_roots:
+            try:
+                resolved.relative_to(root.resolve())
+                return True
+            except (ValueError, OSError):
+                continue
+        return False
+
     def do_GET(self) -> None:  # noqa: N802
+        if not self.host_allowed():
+            self.send_error(403)
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/":
             self.send_static(STATIC_DIR / "index.html", "text/html; charset=utf-8")
@@ -77,6 +112,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/logfile":
             path = resolve(parse_qs(parsed.query).get("path", [""])[0])
+            if not self.logfile_allowed(path):
+                self.send_json({"text": "", "error": "Log files can only be read from the ARP folder or the configured ComfyUI folder (.log/.txt)."})
+                return
             text = path.read_text(encoding="utf-8", errors="replace")[-12000:] if path.exists() else ""
             self.send_json({"text": text})
         elif parsed.path == "/api/openai-models":
@@ -173,6 +211,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self.host_allowed():
+            self.send_error(403)
+            return
         parsed = urlparse(self.path)
         data = self.read_json()
         if parsed.path == "/api/settings":

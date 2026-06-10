@@ -194,9 +194,7 @@ STABLE_AUDIO_LICENSE_URL = "https://huggingface.co/stabilityai/stable-audio-open
 STABLE_AUDIO_DEFAULT_CHECKPOINT = "stable_audio_open_1.0.safetensors"
 
 # Shared artifact identity/naming/sizing (single source of truth, also imported by the producer
-# scripts). Lives under scripts/, so put that on the path before importing.
-if str(SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS))
+# scripts). scripts/ is on sys.path via the package __init__.
 import artifact_ids as aid  # noqa: E402
 
 
@@ -238,15 +236,7 @@ def stable_audio_browser_handoff(checkpoint: str) -> tuple[bool, str]:
     )
 
 
-def combine_outpaint_prompt(prompt: str, suffix: str) -> str:
-    base = (prompt or "").strip()
-    extra = (suffix or "").strip()
-    if not base:
-        return extra
-    if not extra:
-        return base
-    separator = " " if base.endswith((".", "!", "?", ":")) else ". "
-    return f"{base}{separator}{extra}"
+combine_outpaint_prompt = aid.combine_prompt
 
 
 def source_dimensions_from_info(info: dict[str, str]) -> tuple[int, int] | None:
@@ -298,17 +288,6 @@ def source_defaults_for(source: Path, monochrome: bool | None = None, info: dict
         except Exception:
             metadata = {}
     return source_workflow_defaults(metadata, monochrome)
-
-
-
-
-DEFAULT_ANCHOR_PROMPT = "Replace the black bars."
-
-
-
-
-
-
 
 
 class PipelineApp:
@@ -444,15 +423,20 @@ class PipelineApp:
             rows.append({"stage": stage.title, "status": "Ready" if ready else "Waiting", "latest": rel(latest) if latest else ""})
         return rows
 
-    def phase_progress(self) -> dict:
+    def phase_progress(self, progress_rows: list[dict[str, str]] | None = None) -> dict:
         current = self.estimate_running_progress()
         stages = []
         completed = 0.0
         active_label = ""
         active = self.active_stages()
+        # progress() resolves and stats every expected output, so compute it once for all
+        # stages (callers that already have it, like state(), pass it in).
+        if progress_rows is None:
+            progress_rows = self.progress()
+        latest_by_stage = {item["stage"]: item["latest"] for item in progress_rows}
         for stage in active:
             title = stage.title
-            latest = next((item["latest"] for item in self.progress() if item["stage"] == title), "")
+            latest = latest_by_stage.get(title, "")
             if self.running_stage_key == stage.key and current:
                 percent = current["percent"]
                 label = current["label"]
@@ -637,15 +621,19 @@ class PipelineApp:
             outpaint_chunks = outpaint_chunks_state(self.settings) if view == "outpaint" else {"manifest": "", "rows": []}
             shots = shot_views(self.settings) if view in {"shots", "references", "colour"} else {"manifest": "", "rows": []}
             cache = cache_state() if view == "cache" else {}
+            stages_with_output = (*self.active_stages(), output_stage())
+            expected_outputs = {stage.key: self.expected_outputs(stage.key) for stage in stages_with_output}
+            existing_outputs = {key: [path for path in paths if path and resolve(path).exists()] for key, paths in expected_outputs.items()}
+            progress_rows = self.progress()
             return {
                 "root": str(ROOT),
                 "version": APP_VERSION,
-                "stages": [stage.__dict__ | {"files": self.files_for(stage)} for stage in (*self.active_stages(), output_stage())],
+                "stages": [stage.__dict__ | {"files": self.files_for(stage)} for stage in stages_with_output],
                 "settings": self.settings,
-                "progress": self.progress(),
-                "phase_progress": self.phase_progress(),
-                "expected_outputs": {stage.key: self.expected_outputs(stage.key) for stage in (*self.active_stages(), output_stage())},
-                "existing_outputs": {stage.key: self.existing_outputs(stage.key) for stage in (*self.active_stages(), output_stage())},
+                "progress": progress_rows,
+                "phase_progress": self.phase_progress(progress_rows),
+                "expected_outputs": expected_outputs,
+                "existing_outputs": existing_outputs,
                 "upscale_preview": self.upscale_preview_state(),
                 "output_selection": self.output_selection_state(),
                 "source_previews": source_media["previews"],
@@ -1147,6 +1135,61 @@ class PipelineApp:
             cmd.append("--dry-run")
         return [part for part in cmd if part != ""]
 
+    def _reset_running_state(self) -> None:
+        self.running_stage = ""
+        self.running_stage_key = ""
+        self.running_reference_manifest = ""
+        self.running_reference_index = None
+        self.run_started_at = 0.0
+
+    def _start_process(
+        self,
+        stage_title: str,
+        stage_key: str,
+        cmd: list[str],
+        *,
+        log_lines: tuple[str, ...] = (),
+        reference_manifest: str = "",
+        reference_index: int | None = None,
+        collector=None,
+        collector_args: tuple = (),
+        failure_label: str = "command",
+    ) -> tuple[bool, str]:
+        """Start a pipeline subprocess and its log-collector thread.
+
+        The one place that owns the running-state bookkeeping, command redaction, platform
+        process-group flags, and start-failure rollback, so every runner behaves identically.
+        The freshly created Popen object is handed to the collector thread directly — collectors
+        must never read self.process, which may already point at a newer process by the time
+        they finish draining output.
+        """
+        with self.lock:
+            if self.process and self.process.poll() is None:
+                return False, "A command is already running."
+            self.running_stage = stage_title
+            self.running_stage_key = stage_key
+            self.running_reference_manifest = reference_manifest
+            self.running_reference_index = reference_index
+            self.run_started_at = time.time()
+            for line in log_lines:
+                self.log.append(line)
+            self.log.append("> " + redact_command_for_log(cmd))
+            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                kwargs["start_new_session"] = True
+            try:
+                self.process = subprocess.Popen(cmd, **kwargs)
+            except Exception as exc:
+                self._reset_running_state()
+                self.log.append(f"Could not start {failure_label}: {exc}")
+                return False, f"Could not start {failure_label}: {exc}"
+            target = collector or self._collect_output
+            args = (self.process, *(collector_args or (stage_key,)))
+            threading.Thread(target=target, args=args, daemon=True).start()
+        return True, f"Started {stage_title}"
+
     def run_stage(self, stage_key: str) -> tuple[bool, str]:
         if self.quitting:
             return False, "ARP is shutting down."
@@ -1202,22 +1245,8 @@ class PipelineApp:
             ok, message = ensure_comfy_available_for_stage(stage.title)
             if not ok:
                 return False, message
-        with self.lock:
-            if self.process and self.process.poll() is None:
-                return False, "A command is already running."
-            self.running_stage = stage.title
-            self.running_stage_key = stage.key
-            self.run_started_at = time.time()
-            cmd = self.command_for(stage_key)
-            self.log.append("> " + redact_command_for_log(cmd))
-            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
-            self.process = subprocess.Popen(cmd, **kwargs)
-            threading.Thread(target=self._collect_output, args=(stage_key,), daemon=True).start()
-        return True, "Started " + stage.title
+        cmd = self.command_for(stage_key)
+        return self._start_process(stage.title, stage.key, cmd, failure_label=stage.title)
 
     def run_outpaint_chunk(self, index: int) -> tuple[bool, str]:
         if not self.settings.get("global", {}).get("source"):
@@ -1229,23 +1258,11 @@ class PipelineApp:
         ok, message = ensure_comfy_available_for_stage("Outpainting")
         if not ok:
             return False, message
-        with self.lock:
-            if self.process and self.process.poll() is None:
-                return False, "A command is already running."
-            self.running_stage = f"Outpainting chunk {index + 1}"
-            self.running_stage_key = "outpaint"
-            self.run_started_at = time.time()
-            cmd = self.command_for("outpaint")
-            cmd.extend(["--only-chunk", str(index), "--force"])
-            self.log.append("> " + " ".join(cmd))
-            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
-            self.process = subprocess.Popen(cmd, **kwargs)
-            threading.Thread(target=self._collect_output, args=("outpaint",), daemon=True).start()
-        return True, f"Started outpaint chunk {index + 1}"
+        cmd = self.command_for("outpaint")
+        cmd.extend(["--only-chunk", str(index), "--force"])
+        return self._start_process(
+            f"Outpainting chunk {index + 1}", "outpaint", cmd, failure_label="outpaint chunk regeneration"
+        )
 
     def run_reference_regeneration(self, manifest_text: str, index: int, provider: str = "qwen") -> tuple[bool, str]:
         provider = "openai" if (provider == "openai" or self.settings.get("references", {}).get("method") == "openai") else "qwen"
@@ -1260,33 +1277,18 @@ class PipelineApp:
                 cmd, output = reference_regeneration_command(manifest_text, index)
         except Exception as exc:
             return False, str(exc)
-        with self.lock:
-            if self.process and self.process.poll() is None:
-                return False, "A command is already running."
-            self.running_stage = "Reference Generation"
-            self.running_stage_key = "references"
-            self.running_reference_manifest = manifest_text
-            self.running_reference_index = index
-            self.run_started_at = time.time()
-            label = "OpenAI" if provider == "openai" else "Qwen"
-            self.log.append(f"Regenerating colour reference with {label} for shot {index + 1}: {output}")
-            self.log.append("> " + redact_command_for_log(cmd))
-            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
-            try:
-                self.process = subprocess.Popen(cmd, **kwargs)
-            except Exception as exc:
-                self.running_stage = ""
-                self.running_stage_key = ""
-                self.running_reference_manifest = ""
-                self.running_reference_index = None
-                self.run_started_at = 0.0
-                self.log.append(f"Could not start reference regeneration: {exc}")
-                return False, f"Could not start reference regeneration: {exc}"
-            threading.Thread(target=self._collect_output, args=("references",), daemon=True).start()
+        label = "OpenAI" if provider == "openai" else "Qwen"
+        ok, message = self._start_process(
+            "Reference Generation",
+            "references",
+            cmd,
+            log_lines=(f"Regenerating colour reference with {label} for shot {index + 1}: {output}",),
+            reference_manifest=manifest_text,
+            reference_index=index,
+            failure_label="reference regeneration",
+        )
+        if not ok:
+            return False, message
         return True, f"Started {provider} reference regeneration for shot {index + 1}."
 
     def run_reference_edit_preview(self, manifest_text: str, index: int, instruction: str, mask_data: str = "", sampled_color: str = "") -> tuple[bool, str, str]:
@@ -1297,33 +1299,18 @@ class PipelineApp:
             cmd, output = reference_edit_preview_command(manifest_text, index, instruction, mask_data, sampled_color)
         except Exception as exc:
             return False, str(exc), ""
-        with self.lock:
-            if self.process and self.process.poll() is None:
-                return False, "A command is already running.", output
-            self.running_stage = "Reference Editing"
-            self.running_stage_key = "references"
-            self.running_reference_manifest = manifest_text
-            self.running_reference_index = index
-            self.run_started_at = time.time()
-            mode = "masked" if mask_data else "unmasked"
-            self.log.append(f"Generating {mode} reference edit preview for shot {index + 1}: {output}")
-            self.log.append("> " + redact_command_for_log(cmd))
-            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
-            try:
-                self.process = subprocess.Popen(cmd, **kwargs)
-            except Exception as exc:
-                self.running_stage = ""
-                self.running_stage_key = ""
-                self.running_reference_manifest = ""
-                self.running_reference_index = None
-                self.run_started_at = 0.0
-                self.log.append(f"Could not start reference edit preview: {exc}")
-                return False, f"Could not start reference edit preview: {exc}", output
-            threading.Thread(target=self._collect_output, args=("references",), daemon=True).start()
+        mode = "masked" if mask_data else "unmasked"
+        ok, message = self._start_process(
+            "Reference Editing",
+            "references",
+            cmd,
+            log_lines=(f"Generating {mode} reference edit preview for shot {index + 1}: {output}",),
+            reference_manifest=manifest_text,
+            reference_index=index,
+            failure_label="reference edit preview",
+        )
+        if not ok:
+            return False, message, output
         return True, f"Started reference edit preview for shot {index + 1}.", output
 
     def run_outpaint_end_guide_generation(self, index: int, prompt: str) -> tuple[bool, str]:
@@ -1335,33 +1322,17 @@ class PipelineApp:
         except Exception as exc:
             return False, str(exc)
         output = resolve(output_rel)
-        with self.lock:
-            if self.process and self.process.poll() is None:
-                return False, "A command is already running."
-            self.running_stage = f"Generating end guide frame for chunk {index + 1}"
-            self.running_stage_key = "outpaint"
-            self.run_started_at = time.time()
-            self.log.append(f"Generating Qwen end guide frame for chunk {index + 1}: {output_rel}")
-            self.log.append("> " + " ".join(cmd))
-            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
-            try:
-                self.process = subprocess.Popen(cmd, **kwargs)
-            except Exception as exc:
-                self.running_stage = ""
-                self.running_stage_key = ""
-                self.run_started_at = 0.0
-                self.log.append(f"Could not start end guide frame generation: {exc}")
-                return False, f"Could not start end guide frame generation: {exc}"
-            threading.Thread(
-                target=self._collect_output_guide,
-                args=(output, prepared_canvas),
-                kwargs={"source_seconds": source_seconds},
-                daemon=True,
-            ).start()
+        ok, message = self._start_process(
+            f"Generating end guide frame for chunk {index + 1}",
+            "outpaint",
+            cmd,
+            log_lines=(f"Generating Qwen end guide frame for chunk {index + 1}: {output_rel}",),
+            collector=self._collect_output_guide,
+            collector_args=(output, prepared_canvas, source_seconds),
+            failure_label="end guide frame generation",
+        )
+        if not ok:
+            return False, message
         return True, f"Started Qwen end guide frame generation for chunk {index + 1}."
 
     def run_outpaint_guide_generation(self, index: int, prompt: str) -> tuple[bool, str]:
@@ -1373,33 +1344,17 @@ class PipelineApp:
         except Exception as exc:
             return False, str(exc)
         output = resolve(output_rel)
-        with self.lock:
-            if self.process and self.process.poll() is None:
-                return False, "A command is already running."
-            self.running_stage = f"Generating guide frame for chunk {index + 1}"
-            self.running_stage_key = "outpaint"
-            self.run_started_at = time.time()
-            self.log.append(f"Generating Qwen guide frame for chunk {index + 1}: {output_rel}")
-            self.log.append("> " + " ".join(cmd))
-            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
-            try:
-                self.process = subprocess.Popen(cmd, **kwargs)
-            except Exception as exc:
-                self.running_stage = ""
-                self.running_stage_key = ""
-                self.run_started_at = 0.0
-                self.log.append(f"Could not start guide frame generation: {exc}")
-                return False, f"Could not start guide frame generation: {exc}"
-            threading.Thread(
-                target=self._collect_output_guide,
-                args=(output, prepared_canvas),
-                kwargs={"source_seconds": source_seconds},
-                daemon=True,
-            ).start()
+        ok, message = self._start_process(
+            f"Generating guide frame for chunk {index + 1}",
+            "outpaint",
+            cmd,
+            log_lines=(f"Generating Qwen guide frame for chunk {index + 1}: {output_rel}",),
+            collector=self._collect_output_guide,
+            collector_args=(output, prepared_canvas, source_seconds),
+            failure_label="guide frame generation",
+        )
+        if not ok:
+            return False, message
         return True, f"Started Qwen guide frame generation for chunk {index + 1}."
 
     def run_guide_frame_generation(self, chunk_index: int, guide_index: int, frame_idx: int, prompt: str) -> tuple[bool, str]:
@@ -1411,33 +1366,17 @@ class PipelineApp:
         except Exception as exc:
             return False, str(exc)
         output = resolve(output_rel)
-        with self.lock:
-            if self.process and self.process.poll() is None:
-                return False, "A command is already running."
-            self.running_stage = f"Generating guide frame {guide_index} for chunk {chunk_index + 1}"
-            self.running_stage_key = "outpaint"
-            self.run_started_at = time.time()
-            self.log.append(f"Generating Qwen guide (chunk {chunk_index + 1}, guide {guide_index}, frame_idx={frame_idx}): {output_rel}")
-            self.log.append("> " + " ".join(cmd))
-            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
-            try:
-                self.process = subprocess.Popen(cmd, **kwargs)
-            except Exception as exc:
-                self.running_stage = ""
-                self.running_stage_key = ""
-                self.run_started_at = 0.0
-                self.log.append(f"Could not start guide frame generation: {exc}")
-                return False, f"Could not start guide frame generation: {exc}"
-            threading.Thread(
-                target=self._collect_output_guide,
-                args=(output, prepared_canvas),
-                kwargs={"source_seconds": source_seconds},
-                daemon=True,
-            ).start()
+        ok, message = self._start_process(
+            f"Generating guide frame {guide_index} for chunk {chunk_index + 1}",
+            "outpaint",
+            cmd,
+            log_lines=(f"Generating Qwen guide (chunk {chunk_index + 1}, guide {guide_index}, frame_idx={frame_idx}): {output_rel}",),
+            collector=self._collect_output_guide,
+            collector_args=(output, prepared_canvas, source_seconds),
+            failure_label="guide frame generation",
+        )
+        if not ok:
+            return False, message
         return True, f"Started Qwen guide frame generation for chunk {chunk_index + 1}, guide {guide_index}."
 
     def upscale_input_for(self) -> str:
@@ -1522,31 +1461,19 @@ class PipelineApp:
             cmd = self.upscale_command(values, rel(clip), output)
         except Exception as exc:
             return False, f"Could not prepare upscale preview: {exc}"
-        with self.lock:
-            if self.process and self.process.poll() is None:
-                return False, "A command is already running."
-            self.running_stage = "Upscale Preview"
-            self.running_stage_key = "upscale"
-            self.run_started_at = time.time()
-            values["preview_source"] = rel(clip)
-            values["preview_output"] = output
-            self.save()
-            self.log.append(f"Generating upscale preview: {output}")
-            self.log.append("> " + redact_command_for_log(cmd))
-            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
-            try:
-                self.process = subprocess.Popen(cmd, **kwargs)
-            except Exception as exc:
-                self.running_stage = ""
-                self.running_stage_key = ""
-                self.run_started_at = 0.0
-                self.log.append(f"Could not start upscale preview: {exc}")
-                return False, f"Could not start upscale preview: {exc}"
-            threading.Thread(target=self._collect_output, args=("upscale_preview",), daemon=True).start()
+        values["preview_source"] = rel(clip)
+        values["preview_output"] = output
+        self.save()
+        ok, message = self._start_process(
+            "Upscale Preview",
+            "upscale",
+            cmd,
+            log_lines=(f"Generating upscale preview: {output}",),
+            collector_args=("upscale_preview",),
+            failure_label="upscale preview",
+        )
+        if not ok:
+            return False, message
         return True, "Started upscale preview."
 
     def upscale_preview_clip_source(self, preview_seconds: float) -> tuple[Path, float, float, str]:
@@ -1572,52 +1499,45 @@ class PipelineApp:
             cmd, output = guide_edit_preview_command(chunk_index, guide_index, instruction, mask_data, sampled_color)
         except Exception as exc:
             return False, str(exc), ""
-        with self.lock:
-            if self.process and self.process.poll() is None:
-                return False, "A command is already running.", output
-            self.running_stage = f"Editing guide frame {guide_index + 1} for chunk {chunk_index + 1}"
-            self.running_stage_key = "outpaint"
-            self.run_started_at = time.time()
-            mode = "masked" if mask_data else "unmasked"
-            self.log.append(f"Generating {mode} guide edit preview (chunk {chunk_index + 1}, guide {guide_index + 1}): {output}")
-            self.log.append("> " + redact_command_for_log(cmd))
-            kwargs: dict = {"cwd": ROOT, "text": True, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs["start_new_session"] = True
-            try:
-                self.process = subprocess.Popen(cmd, **kwargs)
-            except Exception as exc:
-                self.running_stage = ""
-                self.running_stage_key = ""
-                self.run_started_at = 0.0
-                self.log.append(f"Could not start guide edit preview: {exc}")
-                return False, f"Could not start guide edit preview: {exc}", output
+        source = Path("")
+        try:
+            sidecar = resolve(output).with_suffix(resolve(output).suffix + ".json")
+            source_text = json.loads(sidecar.read_text(encoding="utf-8")).get("source_image", "")
+            source = resolve(source_text) if source_text else Path("")
+        except Exception:
             source = Path("")
-            try:
-                sidecar = resolve(output).with_suffix(resolve(output).suffix + ".json")
-                source_text = json.loads(sidecar.read_text(encoding="utf-8")).get("source_image", "")
-                source = resolve(source_text) if source_text else Path("")
-            except Exception:
-                source = Path("")
-            threading.Thread(target=self._collect_output_guide_edit, args=(resolve(output), source), daemon=True).start()
+        mode = "masked" if mask_data else "unmasked"
+        ok, message = self._start_process(
+            f"Editing guide frame {guide_index + 1} for chunk {chunk_index + 1}",
+            "outpaint",
+            cmd,
+            log_lines=(f"Generating {mode} guide edit preview (chunk {chunk_index + 1}, guide {guide_index + 1}): {output}",),
+            collector=self._collect_output_guide_edit,
+            collector_args=(resolve(output), source),
+            failure_label="guide edit preview",
+        )
+        if not ok:
+            return False, message, output
         return True, f"Started guide edit preview for chunk {chunk_index + 1}, guide {guide_index + 1}.", output
 
-    def _collect_output_guide_edit(self, output: Path, source: Path) -> None:
-        """Collect a guide edit preview and normalize the Qwen result to the editor image size."""
-        assert self.process and self.process.stdout
-        for line in self.process.stdout:
+    def _drain_process(self, process: subprocess.Popen[str]) -> int:
+        """Stream a process's output into the log and return its exit code.
+
+        Collectors receive the Popen they were started for and must use only it — by the time
+        output is drained, self.process may already point at a newer process.
+        """
+        assert process.stdout
+        for line in process.stdout:
             with self.lock:
                 self.log.append(line.rstrip())
-        code = self.process.wait()
+        return process.wait()
+
+    def _collect_output_guide_edit(self, process: subprocess.Popen[str], output: Path, source: Path) -> None:
+        """Collect a guide edit preview and normalize the Qwen result to the editor image size."""
+        code = self._drain_process(process)
         with self.lock:
             self.log.append(f"Process finished with exit code {code}.")
-            self.running_stage = ""
-            self.running_stage_key = ""
-            self.running_reference_manifest = ""
-            self.running_reference_index = None
-            self.run_started_at = 0.0
+            self._reset_running_state()
             if code == 0 and output.exists() and source.exists():
                 try:
                     normalize_guide_preview_to_source(output, source)
@@ -1627,20 +1547,12 @@ class PipelineApp:
             if code == 0:
                 self.hydrate_stage_inputs("outpaint")
 
-    def _collect_output_guide(self, output: Path, prepared_canvas: Path, source_seconds: float | None = None) -> None:
+    def _collect_output_guide(self, process: subprocess.Popen[str], output: Path, prepared_canvas: Path, source_seconds: float | None = None) -> None:
         """Like _collect_output but composites the guide in-place after a successful Qwen run."""
-        assert self.process and self.process.stdout
-        for line in self.process.stdout:
-            with self.lock:
-                self.log.append(line.rstrip())
-        code = self.process.wait()
+        code = self._drain_process(process)
         with self.lock:
             self.log.append(f"Process finished with exit code {code}.")
-            self.running_stage = ""
-            self.running_stage_key = ""
-            self.running_reference_manifest = ""
-            self.running_reference_index = None
-            self.run_started_at = 0.0
+            self._reset_running_state()
             if code == 0 and output.exists() and prepared_canvas.exists():
                 try:
                     _composite_guide_in_place(output, prepared_canvas, source_seconds=source_seconds)
@@ -1671,19 +1583,11 @@ class PipelineApp:
     def ensure_pipeline_source(self) -> None:
         ensure_source_section_clip(self.settings)
 
-    def _collect_output(self, stage_key: str) -> None:
-        assert self.process and self.process.stdout
-        for line in self.process.stdout:
-            with self.lock:
-                self.log.append(line.rstrip())
-        code = self.process.wait()
+    def _collect_output(self, process: subprocess.Popen[str], stage_key: str) -> None:
+        code = self._drain_process(process)
         with self.lock:
             self.log.append(f"Process finished with exit code {code}.")
-            self.running_stage = ""
-            self.running_stage_key = ""
-            self.running_reference_manifest = ""
-            self.running_reference_index = None
-            self.run_started_at = 0.0
+            self._reset_running_state()
             if code == 0 and stage_key != "upscale_preview":
                 self.hydrate_stage_inputs(stage_key)
             elif code == 0 and stage_key == "upscale_preview":
@@ -1706,408 +1610,6 @@ class PipelineApp:
 APP = PipelineApp()
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def _outpaint_crop_black(values: dict[str, str]) -> tuple[list[int], bool]:
-    crop = [int(float(values.get(key, "0") or 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
-    black = values.get("outpaint_all_black_regions", "false") == "true"
-    return crop, black
-
-
-def manifest_for_outpainted(outpainted_text: str) -> str:
-    if not outpainted_text:
-        return ""
-    outpainted = resolve(outpainted_text)
-    ident = aid.shots_identity(outpainted.stem)
-    return rel(ROOT / "manifests" / "references" / aid.artifact_name(aid.source_word(outpainted.name), "shots", ident, "csv"))
-
-
-def outpaint_output_for(source_text: str, aspect: str, target_height_text: str = "720") -> str:
-    if not source_text:
-        return ""
-    source = resolve_video_source(source_text)
-    # Name via the shared identity (scripts/artifact_ids.py), the same call the producer
-    # (outpaint_video.default_output) makes, so the GUI and the script can never drift apart.
-    width, height = outpaint_work_size_for_source(source_text, aspect, target_height_text)
-    values = APP.settings.get("outpaint", {}) if "APP" in globals() else {}
-    crop, black = _outpaint_crop_black(values)
-    return rel(ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "outpaint", "mp4"))
-
-
-def upscale_target_size(values: dict[str, str]) -> tuple[int, int]:
-    try:
-        width = even_int(int(float(values.get("target_width", "3840") or 3840)))
-    except ValueError:
-        width = 3840
-    try:
-        height = even_int(int(float(values.get("target_height", "2160") or 2160)))
-    except ValueError:
-        height = 2160
-    return max(2, width), max(2, height)
-
-
-def upscale_output_for(source_text: str, values: dict[str, str]) -> str:
-    if not source_text:
-        return ""
-    source = resolve(source_text)
-    width, height = upscale_target_size(values)
-    ident = aid.upscale_identity(source.stem, width, height, "flashvsr")
-    return rel(ROOT / "output" / "upscaled" / aid.artifact_name(aid.source_word(source.name), "upscale", ident, "mp4"))
-
-
-def soundtrack_output_for(source_text: str, values: dict[str, str]) -> str:
-    if not source_text:
-        return ""
-    source = resolve(source_text)
-    music = values.get("create_music", "true") == "true"
-    sfx = values.get("create_sfx", "true") == "true"
-    ident = aid.soundtrack_identity(source.stem, music, sfx)
-    return rel(ROOT / "output" / "with_soundtrack" / aid.artifact_name(aid.source_word(source.name), "audio", ident, "mp4"))
-
-
-def upscale_preview_output_for(source_text: str, values: dict[str, str]) -> str:
-    if not source_text:
-        return ""
-    source = resolve(source_text)
-    width, height = upscale_target_size(values)
-    seconds = str(values.get("preview_seconds", "6") or "6")
-    ident = aid.upscale_preview_identity(source.stem, width, height, "flashvsr", seconds)
-    return rel(ROOT / "output" / "upscaled" / "previews" / aid.artifact_name(aid.source_word(source.name), "upscalepreview", ident, "mp4"))
-
-
-def source_duration_text(source: Path) -> str:
-    try:
-        duration = float(video_metrics(source).get("duration") or 0)
-    except Exception:
-        return ""
-    return f"{duration:.3f}" if duration > 0 else ""
-
-
-def source_video_height(source_text: str) -> int:
-    try:
-        source = resolve_video_source(source_text)
-        metrics = video_metrics(source)
-        return even_int(int(metrics.get("height") or 720))
-    except Exception:
-        return 720
-
-
-# Size math is centralised in scripts/artifact_ids.py so the GUI and the producer scripts agree.
-def resolved_outpaint_height(source_text: str, target_height_text: str = "720") -> int:
-    return aid.resolved_height(source_video_height(source_text), target_height_text)
-
-
-def outpaint_size_for_source(source_text: str, aspect: str, target_height_text: str = "720") -> tuple[int, int]:
-    return aid.delivery_size(source_video_height(source_text), aspect, target_height_text)
-
-
-def outpaint_work_size_for_source(source_text: str, aspect: str, target_height_text: str = "720") -> tuple[int, int]:
-    return aid.work_size(source_video_height(source_text), aspect, target_height_text)
-
-
-def outpaint_chunk_dir_for(source_text: str, values: dict[str, str]) -> Path:
-    source = resolve_video_source(source_text)
-    aspect = values.get("target_aspect", "16:9")
-    width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
-    crop, black = _outpaint_crop_black(values)
-    return ROOT / ".cache" / "outpaint_chunks" / aid.outpaint_basename(source.name, aspect, width, height, crop, black, "chunks")
-
-
-def outpaint_chunk_manifest_for(source_text: str, values: dict[str, str]) -> str:
-    if not source_text:
-        return ""
-    source = resolve_video_source(source_text)
-    aspect = values.get("target_aspect", "16:9")
-    width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
-    crop, black = _outpaint_crop_black(values)
-    return rel(ROOT / "manifests" / "outpaint_chunks" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "chunks", "csv"))
-
-
-def outpaint_chunk_offset_slug(row: dict[str, str]) -> str:
-    try:
-        offset_x = int(float(row.get("offset_x", "0") or 0))
-        offset_y = int(float(row.get("offset_y", "0") or 0))
-    except ValueError:
-        offset_x = offset_y = 0
-    return "" if not (offset_x or offset_y) else f"_ox{offset_x:+d}_oy{offset_y:+d}"
-
-
-def outpaint_prepared_for(source_text: str, values: dict[str, str]) -> Path:
-    source = resolve_video_source(source_text)
-    aspect = values.get("target_aspect", "16:9")
-    height_text = values.get("target_height", "720")
-    work_w, work_h = outpaint_work_size_for_source(source_text, aspect, height_text)
-    crop, black = _outpaint_crop_black(values)
-    return ROOT / "intermediate" / "outpaint_prepared" / aid.outpaint_name(source.name, aspect, work_w, work_h, crop, black, "prepared", "mp4")
-
-
-def ensure_outpaint_prepared_canvas(source_text: str, values: dict[str, str]) -> Path:
-    source = resolve_video_source(source_text)
-    prepared = outpaint_prepared_for(source_text, values)
-    if prepared.exists():
-        return prepared
-
-    cmd = [
-        sys.executable,
-        str(SCRIPTS / "prepare_outpaint_input.py"),
-        "--source",
-        str(source),
-        "--target-aspect",
-        values.get("target_aspect", "16:9"),
-        "--black-lift",
-        str(values.get("black_lift", "0.018") or "0.018"),
-        "--gamma",
-        str(values.get("gamma", "1.06") or "1.06"),
-        "--output",
-        str(prepared),
-        "--crop-left",
-        str(values.get("crop_left", "0") or "0"),
-        "--crop-right",
-        str(values.get("crop_right", "0") or "0"),
-        "--crop-top",
-        str(values.get("crop_top", "0") or "0"),
-        "--crop-bottom",
-        str(values.get("crop_bottom", "0") or "0"),
-        "--target-width",
-        str(outpaint_work_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[0]),
-        "--target-height",
-        str(outpaint_work_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[1]),
-        "--delivery-width",
-        str(outpaint_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[0]),
-        "--delivery-height",
-        str(outpaint_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[1]),
-    ]
-    if values.get("outpaint_all_black_regions", "false") == "true":
-        cmd.append("--outpaint-all-black-regions")
-    APP.log.append(f"Preparing expanded canvas for guide frame: {rel(prepared)}")
-    APP.log.append("> " + " ".join(cmd))
-    result = subprocess.run(cmd, cwd=ROOT, check=False, capture_output=True, text=True)
-    for line in (result.stdout or "").splitlines():
-        APP.log.append(line)
-    for line in (result.stderr or "").splitlines():
-        APP.log.append(line)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr or result.stdout or "Could not prepare expanded outpaint canvas.")
-    if not prepared.exists():
-        raise RuntimeError(f"Prepared expanded canvas was not created: {prepared}")
-    return prepared
-
-
-def outpaint_chunks_state(settings: dict) -> dict:
-    try:
-        ensure_source_section_clip(settings)
-    except Exception as exc:
-        return {"manifest": "", "rows": [], "error": f"Could not prepare selected source section: {exc}"}
-
-    source_text = pipeline_source_text(settings)
-    if not source_text:
-        return {"manifest": "", "rows": []}
-    source = resolve_video_source(source_text)
-    if not source.exists():
-        return {"manifest": "", "rows": [], "error": f"Source material is not a readable file: {source}"}
-    values = settings.get("outpaint", {})
-    metrics = video_metrics(source)
-    fps = metrics.get("fps") or 24.0
-    total_frames = int(metrics.get("frames") or 0)
-    if total_frames <= 0:
-        message = f"Outpaint chunk preview skipped; could not count frames in: {source}"
-        APP.log.append(message)
-        return {"manifest": "", "rows": [], "error": message}
-    try:
-        chunk_seconds = float(values.get("chunk_seconds", "20") or 20)
-    except ValueError:
-        chunk_seconds = 20.0
-    try:
-        overlap_frames = int(float(values.get("overlap_frames", "8") or 8))
-    except ValueError:
-        overlap_frames = 8
-    chunk_dir = outpaint_chunk_dir_for(source_text, values)
-    manifest = resolve(outpaint_chunk_manifest_for(source_text, values))
-    existing = read_outpaint_chunk_rows(manifest)
-    ranges = outpaint_chunk_ranges(total_frames, fps, chunk_seconds, overlap_frames, existing)
-    global_prompt = values.get("prompt") or OUTPAINT_PROMPT
-    global_negative = values.get("negative_prompt", "")
-    rows = []
-    for index, start_frame, end_frame in ranges:
-        row = dict(existing.get(index, {}))
-        row.setdefault("offset_x", "0")
-        row.setdefault("offset_y", "0")
-        offset_slug = outpaint_chunk_offset_slug(row)
-        prepared = chunk_dir / f"prepared_{index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mp4"
-        raw = chunk_dir / f"raw_{index:04d}_{start_frame:06d}_{end_frame:06d}{offset_slug}.mp4"
-        row.update({
-            "chunk_index": str(index),
-            "start_frame": str(start_frame),
-            "end_frame": str(end_frame),
-            "start_seconds": f"{start_frame / fps:.6f}",
-            "end_seconds": f"{end_frame / fps:.6f}",
-            "prepared_path": rel(prepared),
-            "raw_path": rel(raw),
-        })
-        row.setdefault("custom_seconds", "")
-        if not row.get("seed"):
-            row["seed"] = str(42 + index)
-        row.setdefault("prompt_suffix", "")
-        row.setdefault("negative_suffix", "")
-        row.setdefault("guide_image", "")
-        row.setdefault("guide_strength", "0.7")
-        row.setdefault("guide_end_image", "")
-        row.setdefault("guide_end_strength", "1.0")
-        row.setdefault("guide_frames", "")
-        rows.append(row)
-    write_outpaint_chunk_rows(manifest, rows)
-    view_rows = []
-    for row in rows:
-        raw = resolve(row["raw_path"])
-        prepared = resolve(row["prepared_path"])
-        start_seconds = float(row["start_seconds"])
-        end_seconds = float(row["end_seconds"])
-        middle_seconds = (start_seconds + end_seconds) / 2
-        length_frames = int(row["end_frame"]) - int(row["start_frame"])
-        aspect = values.get("target_aspect", "16:9")
-        guides = _build_guide_frames_view(row, source_text, aspect, start_seconds, end_seconds, fps, length_frames)
-        view_rows.append(row | {
-            "index": int(row["chunk_index"]),
-            "start": float(row["start_seconds"]),
-            "end": float(row["end_seconds"]),
-            "fps": fps,
-            "total_frames": total_frames,
-            "length_frames": length_frames,
-            "max_length_frames": max(1, total_frames - int(row["start_frame"])),
-            "start_label": format_timecode(float(row["start_seconds"])),
-            "end_label": format_timecode(float(row["end_seconds"])),
-            "raw_exists": raw.exists(),
-            "raw_mtime": int(raw.stat().st_mtime_ns) if raw.exists() else 0,
-            "prepared_exists": prepared.exists(),
-            "guides": guides,
-            "source_start_preview": "",
-            "source_middle_preview": "",
-            "source_end_preview": "",
-            "raw_start_preview": "",
-            "raw_middle_preview": "",
-            "raw_end_preview": "",
-            "effective_prompt": combine_outpaint_prompt(global_prompt, row.get("prompt_suffix", "")),
-            "effective_negative_prompt": combine_outpaint_prompt(global_negative, row.get("negative_suffix", "")),
-        })
-    return {"manifest": rel(manifest), "rows": view_rows}
-
-
-def outpaint_chunk_preview(settings: dict, chunk_index: int, kind: str, position: str) -> str:
-    chunks = outpaint_chunks_state(settings)
-    row = next((r for r in chunks.get("rows", []) if int(r.get("index", -1)) == chunk_index), None)
-    if row is None:
-        raise IndexError(f"Outpaint chunk not found: {chunk_index + 1}")
-
-    position = position if position in {"start", "middle", "end"} else "middle"
-    fps = max(1.0, float(row.get("fps", 24) or 24))
-    start_seconds = float(row.get("start", 0.0) or 0.0)
-    end_seconds = float(row.get("end", start_seconds) or start_seconds)
-    duration = max(0.0, end_seconds - start_seconds)
-
-    if position == "start":
-        offset = 0.0
-    elif position == "end":
-        offset = max(0.0, duration - (1.0 / fps))
-    else:
-        offset = duration / 2
-
-    if kind == "raw":
-        raw = resolve(str(row.get("raw_path", "")))
-        if not raw.exists():
-            return ""
-        return chunk_frame_preview(raw, offset, f"raw_{chunk_index}_{position}")
-
-    source_text = pipeline_source_text(settings)
-    if not source_text:
-        return ""
-    aspect = settings.get("outpaint", {}).get("target_aspect", "16:9")
-    try:
-        offset_x = int(float(row.get("offset_x", "0") or 0))
-        offset_y = int(float(row.get("offset_y", "0") or 0))
-    except ValueError:
-        offset_x = offset_y = 0
-    return aspect_preview_at(source_text, aspect, start_seconds + offset, offset_x, offset_y)
-
-
-
-
-
-
-
-
-
-
-
-
-def outpaint_chunk_ranges(total_frames: int, fps: float, default_seconds: float, overlap_frames: int, existing: dict[int, dict[str, str]]) -> list[tuple[int, int, int]]:
-    ranges = []
-    start = 0
-    index = 0
-    while start < total_frames:
-        seconds = default_seconds
-        custom = existing.get(index, {}).get("custom_seconds", "")
-        if custom:
-            try:
-                seconds = float(custom)
-            except ValueError:
-                seconds = default_seconds
-        chunk_frames = total_frames if seconds <= 0 else max(1, int(round(seconds * fps)))
-        end = min(total_frames, start + chunk_frames)
-        ranges.append((index, start, end))
-        if end >= total_frames:
-            break
-        overlap = max(0, min(overlap_frames, chunk_frames - 1))
-        start += max(1, chunk_frames - overlap)
-        index += 1
-    return ranges
-
-
-def _truthy_payload_value(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
 def redact_command_for_log(cmd: list[str]) -> str:
     redacted: list[str] = []
     hide_next = False
@@ -2122,386 +1624,14 @@ def redact_command_for_log(cmd: list[str]) -> str:
     return " ".join(redacted)
 
 
-def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str, custom_seconds: str = "", negative_suffix: str = "", guide_strength: str = "", guide_end_strength: str = "", custom_length=None, offset_x: str = "0", offset_y: str = "0") -> None:
-    state = outpaint_chunks_state(APP.settings)
-    manifest_text = state.get("manifest", "")
-    if not manifest_text:
-        raise RuntimeError("No outpaint chunk manifest is available yet.")
-    rows = read_outpaint_chunk_rows(resolve(str(manifest_text)))
-    if index not in rows:
-        raise IndexError(f"Outpaint chunk not found: {index + 1}")
-    row = rows[index]
-    row["seed"] = str(int(float(seed or row.get("seed") or 42 + index)))
-    row["prompt_suffix"] = prompt_suffix
-    row["negative_suffix"] = negative_suffix
-    row["offset_x"] = str(int(float(offset_x or 0)))
-    row["offset_y"] = str(int(float(offset_y or 0)))
-    use_custom_length = _truthy_payload_value(custom_length) if custom_length is not None else bool(custom_seconds)
-    if use_custom_length and custom_seconds:
-        row["custom_seconds"] = f"{max(0.1, float(custom_seconds)):.3f}"
-    else:
-        row["custom_seconds"] = ""
-    if guide_strength:
-        try:
-            row["guide_strength"] = f"{max(0.0, min(1.0, float(guide_strength))):.3f}"
-        except ValueError:
-            pass
-    if guide_end_strength:
-        try:
-            row["guide_end_strength"] = f"{max(0.0, min(1.0, float(guide_end_strength))):.3f}"
-        except ValueError:
-            pass
-    ordered = [rows[key] for key in sorted(rows)]
-    write_outpaint_chunk_rows(resolve(str(manifest_text)), ordered)
-    APP.log.append(f"Saved outpaint chunk {index + 1}: seed {row['seed']}")
-
-
-def remove_cached_file(path: Path) -> bool:
-    removed = False
-    for candidate in (path, path.with_suffix(path.suffix + ".sig.json"), path.with_suffix(path.suffix + ".partial")):
-        try:
-            if candidate.exists() and candidate.is_file():
-                candidate.unlink()
-                removed = True
-        except PermissionError:
-            APP.log.append(f"Could not delete cached file because it is open in another process: {rel(candidate)}")
-        except OSError as exc:
-            APP.log.append(f"Could not delete cached file {rel(candidate)}: {exc}")
-    return removed
-
-
-def clear_cached_guide_frames(manifest: Path, index: int) -> int:
-    guide_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem
-    if not guide_dir.exists():
-        # Also check legacy path name used before the anchorâ†’guide rename.
-        guide_dir = ROOT / "intermediate" / "outpaint_anchors" / manifest.stem
-        if not guide_dir.exists():
-            return 0
-    removed = 0
-    for path in guide_dir.glob(f"chunk_{index:04d}_*"):
-        if path.is_file() and remove_cached_file(path):
-            removed += 1
-    return removed
-
-
-def install_outpaint_guide(index: int) -> dict[str, str]:
-    state = outpaint_chunks_state(APP.settings)
-    manifest_text = state.get("manifest", "")
-    if not manifest_text:
-        raise RuntimeError("No outpaint chunk manifest is available yet.")
-    manifest = resolve(str(manifest_text))
-    rows = read_outpaint_chunk_rows(manifest)
-    if index not in rows:
-        raise IndexError(f"Outpaint chunk not found: {index + 1}")
-
-    current = rows[index].get("guide_image", "")
-    selected = browse_path("image", current)
-    if not selected:
-        return {"selected": "", "guide_image": current}
-
-    source = resolve(selected)
-    if source.suffix.lower() not in IMAGE_EXTS:
-        raise RuntimeError("Choose a PNG or JPEG image for the outpaint guide frame.")
-    if not source.exists() or not source.is_file():
-        raise FileNotFoundError(source)
-
-    target_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem
-    target = target_dir / f"chunk_{index:04d}_guide{source.suffix.lower()}"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target)
-
-    rows[index]["guide_image"] = rel(target)
-    write_outpaint_chunk_rows(manifest, [rows[key] for key in sorted(rows)])
-    APP.log.append(f"Installed outpaint guide frame for chunk {index + 1}: {rel(target)}")
-    return {"selected": selected, "guide_image": rel(target)}
-
-
-def clear_outpaint_guide(index: int) -> dict[str, str]:
-    state = outpaint_chunks_state(APP.settings)
-    manifest_text = state.get("manifest", "")
-    if not manifest_text:
-        raise RuntimeError("No outpaint chunk manifest is available yet.")
-    manifest = resolve(str(manifest_text))
-    rows = read_outpaint_chunk_rows(manifest)
-    if index not in rows:
-        raise IndexError(f"Outpaint chunk not found: {index + 1}")
-    removed = clear_cached_guide_frames(manifest, index)
-    rows[index]["guide_image"] = ""
-    if "anchor_image" in rows[index]:
-        rows[index]["anchor_image"] = ""
-    write_outpaint_chunk_rows(manifest, [rows[key] for key in sorted(rows)])
-    suffix = f" and deleted {removed} cached file(s)" if removed else ""
-    APP.log.append(f"Cleared outpaint guide frame for chunk {index + 1}{suffix}")
-    return {"guide_image": ""}
-
-
-def clear_outpaint_anchor(index: int) -> dict[str, str]:
-    return clear_outpaint_guide(index)
-
-
-def install_outpaint_end_guide(index: int) -> dict[str, str]:
-    state = outpaint_chunks_state(APP.settings)
-    manifest_text = state.get("manifest", "")
-    if not manifest_text:
-        raise RuntimeError("No outpaint chunk manifest is available yet.")
-    manifest = resolve(str(manifest_text))
-    rows = read_outpaint_chunk_rows(manifest)
-    if index not in rows:
-        raise IndexError(f"Outpaint chunk not found: {index + 1}")
-
-    current = rows[index].get("guide_end_image", "")
-    selected = browse_path("image", current)
-    if not selected:
-        return {"selected": "", "guide_end_image": current}
-
-    source = resolve(selected)
-    if source.suffix.lower() not in IMAGE_EXTS:
-        raise RuntimeError("Choose a PNG or JPEG image for the outpaint end guide frame.")
-    if not source.exists() or not source.is_file():
-        raise FileNotFoundError(source)
-
-    target_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem
-    target = target_dir / f"chunk_{index:04d}_guide_end{source.suffix.lower()}"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target)
-
-    rows[index]["guide_end_image"] = rel(target)
-    write_outpaint_chunk_rows(manifest, [rows[key] for key in sorted(rows)])
-    APP.log.append(f"Installed outpaint end guide frame for chunk {index + 1}: {rel(target)}")
-    return {"selected": selected, "guide_end_image": rel(target)}
-
-
-def clear_outpaint_end_guide(index: int) -> dict[str, str]:
-    state = outpaint_chunks_state(APP.settings)
-    manifest_text = state.get("manifest", "")
-    if not manifest_text:
-        raise RuntimeError("No outpaint chunk manifest is available yet.")
-    manifest = resolve(str(manifest_text))
-    rows = read_outpaint_chunk_rows(manifest)
-    if index not in rows:
-        raise IndexError(f"Outpaint chunk not found: {index + 1}")
-    # Remove the end guide file if it's in our managed directory.
-    current = rows[index].get("guide_end_image", "")
-    if current:
-        path = resolve(current)
-        remove_cached_file(path)
-    rows[index]["guide_end_image"] = ""
-    write_outpaint_chunk_rows(manifest, [rows[key] for key in sorted(rows)])
-    APP.log.append(f"Cleared outpaint end guide frame for chunk {index + 1}")
-    return {"guide_end_image": ""}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-from .http_handler import Handler, bind_context as bind_http_handler_context
-
-bind_cache_context(globals())
-bind_project_context(globals())
-bind_media_context(globals())
-bind_references_context(globals())
-bind_file_dialogs_context(globals())
-bind_lifecycle_context(globals())
-bind_outpaint_guides_context(globals())
-bind_http_handler_context(globals())
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-APP.normalize_loaded_source_state()
-
-
 def main() -> int:
     os.chdir(ROOT)
+    # Runs here rather than at import time so importing this module (tests, tooling) never
+    # rewrites the user's live .ai_remaster_gui.json.
+    APP.normalize_loaded_source_state()
     install_shutdown_handlers()
     if os.environ.get("AI_REMASTER_NO_COMFY_AUTOSTART") != "1":
-            start_comfy_if_needed()
+        start_comfy_if_needed()
     host = "127.0.0.1"
     requested_port = int(os.environ.get("AI_REMASTER_GUI_PORT", "8765"))
     server = create_server(host, requested_port)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import shutil
 import subprocess
@@ -27,8 +28,7 @@ from common import (
     write_signature,
 )
 from dependency_manager import ensure_outpaint_models
-from prepare_outpaint_input import default_output as default_prepared_output
-from prepare_outpaint_input import even, parse_aspect, probe_video
+from prepare_outpaint_input import probe_video
 from qwen_seed_guides import DEFAULT_SEED_PROMPT, seed_guides
 import artifact_ids as aid
 
@@ -125,29 +125,11 @@ def copy_reference_frame_to_comfy_input(source: Path, comfy_dir: Path) -> str:
     return f"arp_outpaint/{target.name}"
 
 
-def _inpaint_black_corners(canvas_bgr: "np.ndarray", black_thresh: int = 4) -> "np.ndarray":
-    """Fill any remaining near-black pixels in *canvas_bgr* using OpenCV inpainting.
-
-    Uses a binary mask of pixels whose every channel is ≤ *black_thresh* (pure padding
-    black), then applies cv2.INPAINT_TELEA which is fast and accurate for small regions.
-    Returns the inpainted array (same shape/dtype as input).
-    """
-    import cv2
-    import numpy as np
-
-    mask = np.all(canvas_bgr <= black_thresh, axis=2).astype(np.uint8) * 255
-    if not mask.any():
-        return canvas_bgr
-    inpainted = cv2.inpaint(canvas_bgr, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
-    return inpainted
-
-
 def copy_guide_image_to_comfy_input(
     guide: Path,
     comfy_dir: Path,
     canvas_width: int = 0,
     canvas_height: int = 0,
-    source_frame: "np.ndarray | None" = None,
 ) -> str:
     """Copy a guide image to ComfyUI's input folder, stretched to exactly the LTX canvas size.
 
@@ -392,7 +374,6 @@ def _patch_extra_guides(
     extra_guides: "list[dict]",
     canvas_width: int,
     canvas_height: int,
-    source_frame: "Any",
 ) -> None:
     """Chain one LTXVAddGuideAdvanced node per extra guide frame.
 
@@ -400,8 +381,7 @@ def _patch_extra_guides(
     incrementing by 1 per guide.  The first guide node redirects 5012's downstream
     consumers; each subsequent guide node redirects the previous guide node's consumers.
     """
-    from pathlib import Path as _Path
-    comfy_dir = _Path(args.comfy_dir)
+    comfy_dir = Path(args.comfy_dir)
 
     # Find the VAE source from node 5012's vae input (already resolved by GGUF patching).
     links_map = {lnk[0]: lnk for lnk in workflow.get("links", [])}
@@ -437,9 +417,7 @@ def _patch_extra_guides(
         strength = float(gf.get("strength", 1.0))
         image_path = gf["image"]
 
-        image_name = copy_guide_image_to_comfy_input(
-            image_path, comfy_dir, canvas_width, canvas_height, source_frame=source_frame
-        )
+        image_name = copy_guide_image_to_comfy_input(image_path, comfy_dir, canvas_width, canvas_height)
 
         add_or_replace_node(workflow, {
             "id": load_id,
@@ -486,22 +464,19 @@ def _patch_extra_guides(
             [lat_link, current_src, 2, guide_id, 3, "LATENT"],
         ])
 
-        # Redirect the PREVIOUS source's downstream consumers to this new node.
+        # Redirect the previous source's downstream consumers to this new node. From 5012 only
+        # the known downstream links move (REDIRECT_FROM_5012); from an earlier guide node every
+        # outgoing link moves, because at this point those are exactly the links redirected on the
+        # previous iteration (the chain links built above live in new_links_all, which is merged
+        # into workflow["links"] only at the end). Source slots are preserved — both node types
+        # output (positive, negative, latent) in the same order.
         prev_src = current_src
-        redirect_ids = REDIRECT_FROM_5012 if prev_src == 5012 else set()
-        # For nodes after the first, redirect any links that still point from prev_src
-        # (these are the downstream links we haven't yet redirected).
         for lnk in workflow["links"]:
-            if int(lnk[1]) == prev_src and lnk[0] not in reserved_ids and lnk[0] not in {l[0] for l in new_links_all}:
-                if prev_src == 5012 and lnk[0] in redirect_ids:
-                    lnk[1] = guide_id
-                elif prev_src != 5012:
-                    lnk[1] = guide_id
-
-        if prev_src == 5012:
-            for lnk in workflow["links"]:
-                if lnk[0] in REDIRECT_FROM_5012 and int(lnk[1]) == 5012:
-                    lnk[1] = guide_id
+            if int(lnk[1]) != prev_src:
+                continue
+            if prev_src == 5012 and lnk[0] not in REDIRECT_FROM_5012:
+                continue
+            lnk[1] = guide_id
 
         current_src = guide_id
 
@@ -509,7 +484,7 @@ def _patch_extra_guides(
     workflow["links"] = [l for l in workflow.get("links", []) if l[0] not in reserved_ids] + new_links_all
 
 
-def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str, prompt_text: str, negative_text: str, seed: int | None, guide_image: Path | None = None, extra_guides: "list[dict] | None" = None) -> dict[str, Any]:
+def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Path, output_prefix: str, prompt_text: str, negative_text: str, seed: int | None, guide_image: Path | None = None, extra_guides: "list[dict] | None" = None, *, guide_strength: float | None = None) -> dict[str, Any]:
     video_name = copy_to_comfy_input(prepared, comfy_dir, "arp_outpaint")
     prepared_info = probe_video(prepared)
     set_widget_if_node(workflow, args.load_video_node_id, args.video_widget, video_name)
@@ -524,21 +499,10 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     # and guide images all use the same dimensions — no mismatch, no crop.
     canvas_width = int(prepared_info["width"])
     canvas_height = int(prepared_info["height"])
-    source_frame: "np.ndarray | None" = None
+    if guide_strength is None:
+        guide_strength = getattr(args, "guide_strength", 0.7)
     if guide_image and guide_image.exists():
-        # Extract the first frame of the prepared video to use as source fill for guide black bands.
-        try:
-            import cv2 as _cv2
-            import numpy as _np
-            _cap = _cv2.VideoCapture(str(prepared))
-            _ok, _frame = _cap.read()
-            _cap.release()
-            if _ok and _frame is not None:
-                source_frame = _frame
-        except Exception as _e:
-            print(f"Warning: could not extract source frame for guide compositing: {_e}", flush=True)
-
-        image_name = copy_guide_image_to_comfy_input(guide_image, comfy_dir, canvas_width, canvas_height, source_frame=source_frame)
+        image_name = copy_guide_image_to_comfy_input(guide_image, comfy_dir, canvas_width, canvas_height)
         # Node 5019 "bypass_i2v": False = run LTXVImgToVideoConditionOnly, True = bypass it.
         try:
             bypass_node = node_by_id(workflow, "5019")
@@ -546,7 +510,6 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
         except KeyError:
             pass
         # Apply start-guide strength to LTXVImgToVideoConditionOnly (node 3159) widget 0.
-        guide_strength = getattr(args, "guide_strength", 0.7)
         try:
             i2v_node = node_by_id(workflow, "3159")
             if isinstance(i2v_node.get("widgets_values"), list) and i2v_node["widgets_values"]:
@@ -630,14 +593,16 @@ def patch_workflow(args, workflow: dict[str, Any], prepared: Path, comfy_dir: Pa
     # Extra guide frames via LTXVAddGuideAdvanced — inserted after GGUF patching so the VAE
     # source is already resolved.  Each guide is chained off the previous one.
     if extra_guides:
-        _patch_extra_guides(workflow, args, extra_guides, canvas_width, canvas_height, source_frame)
+        _patch_extra_guides(workflow, args, extra_guides, canvas_width, canvas_height)
 
     return workflow_to_prompt(workflow, args.output_node_id)
 
 
-def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = None, prompt_suffix: str = "", negative_suffix: str = "", guide_image: Path | None = None, extra_guides: "list[dict] | None" = None, auto_guide: bool = False, chunk_manifest: Path | None = None) -> dict[str, Any]:
+def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = None, prompt_suffix: str = "", negative_suffix: str = "", guide_image: Path | None = None, extra_guides: "list[dict] | None" = None, auto_guide: bool = False, chunk_manifest: Path | None = None, *, guide_strength: float | None = None) -> dict[str, Any]:
     prompt_text = combine_prompt(args.prompt, prompt_suffix)
     negative_text = combine_prompt(args.negative_prompt, negative_suffix)
+    if guide_strength is None:
+        guide_strength = getattr(args, "guide_strength", 0.7)
     return {
         "version": 27,
         "tool": "outpaint_video.py/raw_comfy",
@@ -654,7 +619,7 @@ def raw_signature(args, workflow_path: Path, prepared: Path, seed: int | None = 
         "negative_suffix": negative_suffix,
         "guide_image": root_relative(guide_image) if guide_image else "",
         "guide_fingerprint": file_fingerprint(guide_image) if guide_image and guide_image.exists() else None,
-        "guide_strength": getattr(args, "guide_strength", 0.7),
+        "guide_strength": guide_strength,
         "extra_guides": [{"frame_idx": g["frame_idx"], "strength": g["strength"], "image": root_relative(g["image"])} for g in (extra_guides or [])],
         "guide_via_i2v_conditioning": bool(guide_image),
         "auto_guide_from_previous_chunk": auto_guide,
@@ -707,36 +672,7 @@ def black_margin_warning(video: Path, sample_frame: int = 20, side_fraction: flo
     return ""
 
 
-def chunk_ranges(prepared: Path, chunk_seconds: float, overlap_frames: int) -> list[tuple[int, int, int]]:
-    info = probe_video(prepared)
-    total_frames = int(info["frames"])
-    if chunk_seconds <= 0 or total_frames <= 0:
-        return [(0, 0, total_frames)]
-    chunk_frames = max(1, int(round(chunk_seconds * info["fps"])))
-    if chunk_frames >= total_frames:
-        return [(0, 0, total_frames)]
-    overlap = max(0, min(int(overlap_frames), chunk_frames - 1))
-    step = max(1, chunk_frames - overlap)
-    ranges: list[tuple[int, int, int]] = []
-    start = 0
-    while start < total_frames:
-        end = min(total_frames, start + chunk_frames)
-        ranges.append((len(ranges), start, end))
-        if end >= total_frames:
-            break
-        start += step
-    return ranges
-
-
-def combine_prompt(prompt: str, suffix: str) -> str:
-    base = (prompt or "").strip()
-    extra = (suffix or "").strip()
-    if not base:
-        return extra
-    if not extra:
-        return base
-    separator = " " if base.endswith((".", "!", "?", ":")) else ". "
-    return f"{base}{separator}{extra}"
+combine_prompt = aid.combine_prompt
 
 
 def default_chunk_manifest(source: Path, aspect: str, width: int, height: int, args) -> Path:
@@ -761,32 +697,8 @@ def read_chunk_manifest(path: Path) -> dict[int, dict[str, str]]:
 
 def write_chunk_manifest(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = [
-        "chunk_index",
-        "start_frame",
-        "end_frame",
-        "start_seconds",
-        "end_seconds",
-        "custom_seconds",
-        "offset_x",
-        "offset_y",
-        "seed",
-        "prompt_suffix",
-        "negative_suffix",
-        "guide_image",
-        "guide_strength",
-        "guide_end_image",
-        "guide_end_strength",
-        "guide_frames",
-        "anchor_image",
-        "anchor_position",
-        "anchor_seconds",
-        "prepared_path",
-        "raw_path",
-    ]
-    import io as _io
-    buf = _io.StringIO(newline="")
-    writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+    buf = io.StringIO(newline="")
+    writer = csv.DictWriter(buf, fieldnames=aid.CHUNK_MANIFEST_FIELDS, extrasaction="ignore")
     writer.writeheader()
     writer.writerows(rows)
     text = buf.getvalue()
@@ -1299,7 +1211,11 @@ def main() -> int:
                         guide_frames_list.append({"frame_idx": -1, "strength": s, "image": chunk_row["guide_end_image"]})
 
                 # Frame-0 guide → i2v path (explicit_guide); others → LTXVAddGuideAdvanced.
+                # The per-chunk strength stays local so a chunk's explicit guide cannot leak its
+                # strength into later auto-guided chunks (which would also make their resume
+                # signatures order-dependent).
                 explicit_guide: Path | None = None
+                chunk_guide_strength = float(args.guide_strength)
                 extra_guides: list[dict] = []
                 for gf in guide_frames_list:
                     fidx = int(gf.get("frame_idx", 0))
@@ -1309,7 +1225,7 @@ def main() -> int:
                         img_path = None
                     if fidx == 0 and img_path and explicit_guide is None:
                         explicit_guide = img_path
-                        args.guide_strength = float(gf.get("strength", 0.7))
+                        chunk_guide_strength = float(gf.get("strength", 0.7))
                     elif img_path:
                         extra_guides.append({"frame_idx": fidx, "strength": float(gf.get("strength", 1.0)), "image": img_path})
 
@@ -1323,7 +1239,7 @@ def main() -> int:
                     except Exception as exc:
                         print(f"Warning: could not extract auto-guide from previous chunk: {exc}", flush=True)
 
-                chunk_sig = raw_signature(args, workflow_path, chunk_prepared, chunk_seed, chunk_prompt_suffix, chunk_negative_suffix, guide_image, extra_guides, auto_guide)
+                chunk_sig = raw_signature(args, workflow_path, chunk_prepared, chunk_seed, chunk_prompt_suffix, chunk_negative_suffix, guide_image, extra_guides, auto_guide, guide_strength=chunk_guide_strength)
                 if args.only_chunk is not None and chunk_index != args.only_chunk:
                     if not chunk_raw.exists():
                         if chunk_index < args.only_chunk:
@@ -1356,11 +1272,11 @@ def main() -> int:
                 if chunk_negative_suffix:
                     print(f"Chunk {chunk_index + 1} negative suffix: {chunk_negative_suffix}", flush=True)
                 if guide_image:
-                    source = "explicit" if explicit_guide else "auto"
-                    print(f"Chunk {chunk_index + 1} start guide ({source}): {guide_image}", flush=True)
+                    guide_kind = "explicit" if explicit_guide else "auto"
+                    print(f"Chunk {chunk_index + 1} start guide ({guide_kind}): {guide_image}", flush=True)
                 for gf in extra_guides:
                     print(f"Chunk {chunk_index + 1} guide frame_idx={gf['frame_idx']}: {gf['image']}", flush=True)
-                prompt = patch_workflow(args, workflow, chunk_prepared, comfy_dir, chunk_prefix, prompt_text, negative_text, chunk_seed, guide_image, extra_guides)
+                prompt = patch_workflow(args, workflow, chunk_prepared, comfy_dir, chunk_prefix, prompt_text, negative_text, chunk_seed, guide_image, extra_guides, guide_strength=chunk_guide_strength)
                 prompt_id = queue_prompt(args.comfy_url, prompt)
                 print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
                 history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
@@ -1379,7 +1295,7 @@ def main() -> int:
             restitched = True
             try:
                 stitch_chunks(ffmpeg, raw_chunks, effective_ranges, raw_output, float(prepared_info["fps"] or 24.0), True)
-            except PermissionError as exc:
+            except PermissionError:
                 if args.only_chunk is None:
                     raise
                 restitched = False

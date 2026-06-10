@@ -1868,18 +1868,15 @@ class GuiSmokeTests(unittest.TestCase):
             def wait(self) -> int:
                 return 0
 
-        original_process = app.APP.process
         original_log = app.APP.log
-        app.APP.process = FakeProcess()
         app.APP.log = []
         app.APP.running_stage = "Upscale Preview"
         app.APP.running_stage_key = "upscale"
 
         try:
             with mock.patch.object(app.APP, "hydrate_stage_inputs") as hydrate:
-                app.APP._collect_output("upscale_preview")
+                app.APP._collect_output(FakeProcess(), "upscale_preview")
         finally:
-            app.APP.process = original_process
             log = app.APP.log
             app.APP.log = original_log
             app.APP.running_stage = ""

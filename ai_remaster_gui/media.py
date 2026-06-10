@@ -5,21 +5,21 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from . import app_context
 from .cache import human_size
-from .config import ASPECT_PREVIEW_DIR, FILE_PREVIEW_DIR, IMAGE_EXTS, MEDIA_CLIP_DIR, PREVIEW_DIR, ROOT, SCRIPTS, VIDEO_EXTS
-from .paths import parse_aspect, rel, resolve, resolve_video_source, safe_stem
-from .project_io import source_analysis_key, source_signature
+from .config import ASPECT_PREVIEW_DIR, FILE_PREVIEW_DIR, IMAGE_EXTS, MEDIA_CLIP_DIR, PREVIEW_DIR, ROOT, VIDEO_EXTS
+from .file_dialogs import browse_path, parse_duration
+from .paths import even_int, parse_aspect, rel, resolve, resolve_video_source, safe_stem
+from .process_utils import format_duration, format_timecode
+from .project_io import source_signature
 
 SOURCE_PREVIEW_COUNT = 3
 ASPECT_PREVIEW_STYLE_VERSION = 4
 
-if str(SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS))
-import artifact_ids as aid  # noqa: E402
+import artifact_ids as aid  # scripts/ is on sys.path via the package __init__
 
 
 def aspect_preview_identity(source: Path, size: int, mtime_ns: int, aspect: str, crops: tuple[int, int, int, int], seconds: float, offset_x: int = 0, offset_y: int = 0) -> dict:
@@ -38,16 +38,13 @@ def aspect_preview_identity(source: Path, size: int, mtime_ns: int, aspect: str,
     }
 
 
-def bind_context(context: dict) -> None:
-    globals().update(context)
-
 
 def source_previews(source_text: str) -> list[str]:
     signature = source_signature(source_text)
     if signature is None:
         if source_text:
             source = resolve(source_text)
-            APP.log.append(f"Source preview skipped; file was not found or is not a supported video: {source}")
+            app_context.APP.log.append(f"Source preview skipped; file was not found or is not a supported video: {source}")
         return []
     return list(source_previews_cached(*signature))
 
@@ -60,12 +57,12 @@ def source_previews_for_analysis(signature: tuple[str, int, int], info: dict[str
     try:
         if all(frame.exists() and frame.stat().st_mtime_ns >= mtime_ns for frame in frames):
             return tuple(rel(frame) for frame in frames)
-        APP.log.append(f"Generating source previews from: {source}")
+        app_context.APP.log.append(f"Generating source previews from: {source}")
         generate_video_previews(source, target_dir, progress, parse_duration(info.get("duration")))
-        APP.log.append(f"Generated source previews in: {target_dir}")
+        app_context.APP.log.append(f"Generated source previews in: {target_dir}")
         return tuple(rel(frame) for frame in frames if frame.exists())
     except Exception as exc:
-        APP.log.append(f"Could not generate source previews: {exc}")
+        app_context.APP.log.append(f"Could not generate source previews: {exc}")
         return ()
 
 def source_previews_cached(source_path: str, _size: int, mtime_ns: int) -> tuple[str, ...]:
@@ -76,12 +73,12 @@ def source_previews_cached(source_path: str, _size: int, mtime_ns: int) -> tuple
     try:
         if all(frame.exists() and frame.stat().st_mtime_ns >= mtime_ns for frame in frames):
             return tuple(rel(frame) for frame in frames)
-        APP.log.append(f"Generating {SOURCE_PREVIEW_COUNT} source previews from: {source}")
+        app_context.APP.log.append(f"Generating {SOURCE_PREVIEW_COUNT} source previews from: {source}")
         generate_video_previews(source, target_dir)
-        APP.log.append(f"Generated source previews in: {target_dir}")
+        app_context.APP.log.append(f"Generated source previews in: {target_dir}")
         return tuple(rel(frame) for frame in frames if frame.exists())
     except Exception as exc:
-        APP.log.append(f"Could not generate source previews: {exc}")
+        app_context.APP.log.append(f"Could not generate source previews: {exc}")
         return ()
 
 def source_info(source_text: str) -> dict[str, str]:
@@ -89,7 +86,7 @@ def source_info(source_text: str) -> dict[str, str]:
     if signature is None:
         if source_text:
             source = resolve(source_text)
-            APP.log.append(f"Source info skipped; file was not found or is not a supported video: {source}")
+            app_context.APP.log.append(f"Source info skipped; file was not found or is not a supported video: {source}")
         return {}
     return dict(source_info_cached(*signature))
 
@@ -122,13 +119,13 @@ def source_monochrome_cached(source_path: str, size: int, mtime_ns: int) -> bool
 
 def source_info_cached(source_path: str, size: int, _mtime_ns: int) -> tuple[tuple[str, str], ...]:
     source = Path(source_path)
-    APP.log.append(f"Probing source file info: {source}")
+    app_context.APP.log.append(f"Probing source file info: {source}")
     info: dict[str, str] = {"file": rel(source), "size": human_size(size)}
     info.update(ffprobe_info(source))
     return tuple(info.items())
 
 def current_crop_values() -> tuple[int, int, int, int]:
-    values = APP.settings.get("outpaint", {}) if "APP" in globals() else {}
+    values = app_context.APP.settings.get("outpaint", {}) if "app_context.APP" in globals() else {}
     return tuple(max(0, int(float(values.get(key, "0") or 0))) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"))  # type: ignore[return-value]
 
 def aspect_preview(source_text: str, aspect: str) -> str:
@@ -189,8 +186,8 @@ def auto_crop_for_settings(settings: dict, seconds: float) -> dict[str, str | in
         "crop_top": str(top),
         "crop_bottom": str(bottom),
     }
-    APP.update_settings("outpaint", values)
-    APP.log.append(f"Auto Crop set source crop to left {left}, right {right}, top {top}, bottom {bottom}.")
+    app_context.APP.update_settings("outpaint", values)
+    app_context.APP.log.append(f"Auto Crop set source crop to left {left}, right {right}, top {top}, bottom {bottom}.")
     return {**values, "preview": aspect_preview_at_for_settings(settings, seconds)}
 
 def detect_letterbox_crop(image) -> tuple[int, int, int, int]:
@@ -236,7 +233,7 @@ def preview_pipeline_source_text(settings: dict) -> str:
     try:
         ensure_source_section_clip(settings)
     except Exception as exc:
-        APP.log.append(f"Could not prepare selected source section for preview: {exc}")
+        app_context.APP.log.append(f"Could not prepare selected source section for preview: {exc}")
     return pipeline_source_text(settings)
 
 def section_relative_seconds(settings: dict, seconds: float) -> float:
@@ -260,7 +257,7 @@ def aspect_preview_cached(source_path: str, size: int, mtime_ns: int, aspect: st
     try:
         from PIL import Image, ImageOps
     except ModuleNotFoundError:
-        APP.log.append("Pillow is not available; using FFmpeg for the aspect preview.")
+        app_context.APP.log.append("Pillow is not available; using FFmpeg for the aspect preview.")
         preview = ffmpeg_aspect_preview(source, target, aspect, mtime_ns, offset_x, offset_y)
         if preview:
             aid.write_identity(target, identity, label="Aspect preview")
@@ -350,7 +347,7 @@ def ffmpeg_aspect_preview(source: Path, target: Path, aspect: str, mtime_ns: int
         command[3] = "0"
         result = subprocess.run(command, check=False, capture_output=True, text=True)
     if result.returncode != 0:
-        APP.log.append(f"Could not generate aspect preview: {(result.stderr or result.stdout).strip()}")
+        app_context.APP.log.append(f"Could not generate aspect preview: {(result.stderr or result.stdout).strip()}")
     return rel(target) if result.returncode == 0 and target.exists() and target.stat().st_mtime_ns >= mtime_ns else ""
 
 def video_dimensions(source: Path) -> tuple[int, int] | None:
@@ -665,7 +662,7 @@ def export_media_file(path_text: str) -> dict[str, str]:
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.resolve() != source.resolve():
         shutil.copy2(source, target)
-    APP.log.append(f"Saved media file: {rel(source)} -> {target}")
+    app_context.APP.log.append(f"Saved media file: {rel(source)} -> {target}")
     return {"saved": str(target)}
 
 def generate_video_previews(source: Path, target_dir: Path, progress: Callable[[int, str], None] | None = None, duration: float | None = None) -> None:
@@ -700,10 +697,10 @@ def generate_video_previews(source: Path, target_dir: Path, progress: Callable[[
         try:
             result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=30)
         except subprocess.TimeoutExpired:
-            APP.log.append(f"Preview frame {index + 1} timed out at {seconds:.3f}s; skipping it.")
+            app_context.APP.log.append(f"Preview frame {index + 1} timed out at {seconds:.3f}s; skipping it.")
             continue
         if result.returncode != 0:
-            APP.log.append(f"Preview frame {index + 1} failed: {(result.stderr or result.stdout).strip()}")
+            app_context.APP.log.append(f"Preview frame {index + 1} failed: {(result.stderr or result.stdout).strip()}")
 
 
 def pipeline_source_text(settings: dict) -> str:
@@ -795,7 +792,7 @@ def ensure_source_section_clip(settings: dict) -> str:
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "ffmpeg source section trim failed").strip())
     partial.replace(output)
-    APP.log.append(f"Prepared source section clip: {rel(output)}")
+    app_context.APP.log.append(f"Prepared source section clip: {rel(output)}")
     return rel(output)
 
 def section_float(value: str, default: float) -> float:

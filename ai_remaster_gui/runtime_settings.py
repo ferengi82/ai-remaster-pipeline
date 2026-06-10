@@ -138,9 +138,10 @@ def load_settings() -> dict[str, dict[str, str]]:
     old_outpaint_prompts = {
         "Outpaint the black margins with a natural continuation of the black-and-white film frame. Replace all black padding/bars with coherent background, clothing, bodies, props, and set detail that matches the original centre footage. Preserve camera motion, composition, lighting, film grain, and monochrome style. Do not colorize.",
     }
-    if defaults["outpaint"].get("prompt", "").strip() != OUTPAINT_PROMPT or defaults["outpaint"].get("prompt", "") in old_outpaint_prompts:
+    # Migrate retired default prompts to the current one, but leave user-customised prompts alone.
+    if defaults["outpaint"].get("prompt", "").strip() in old_outpaint_prompts or not defaults["outpaint"].get("prompt", "").strip():
         defaults["outpaint"]["prompt"] = OUTPAINT_PROMPT
-    defaults["outpaint"]["seed_qwen_guides"] = "false"
+    defaults["outpaint"].setdefault("seed_qwen_guides", "false")
     defaults["colour"].setdefault("method", "deepexemplar")
     defaults["recomp"].setdefault("colorization_method", "deepexemplar")
     bundled_output = rel(ROOT / "tools" / "comfyui" / "output")

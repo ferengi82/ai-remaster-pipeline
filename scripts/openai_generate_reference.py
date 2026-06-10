@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from common import ROOT, resolve_path
+from common import resolve_path
 
 DEFAULT_MODEL = "gpt-image-2"
 BOUNDARY = "----arp-openai-image-edit"
@@ -35,7 +35,9 @@ def multipart_file(name: str, path: Path) -> bytes:
     return header + path.read_bytes() + b"\r\n"
 
 
-def build_body(args: argparse.Namespace, source: Path, references: list[Path] | None = None) -> bytes:
+def build_body(
+    args: argparse.Namespace, source: Path, references: list[Path] | None = None
+) -> bytes:
     image_paths = [source, *(references or [])]
     image_field = "image[]" if len(image_paths) > 1 else "image"
     parts = [
@@ -61,7 +63,10 @@ def normalize_to_source_size(path: Path, source_path: Path) -> None:
             return
         resampling = getattr(Image, "Resampling", Image).LANCZOS
         image.convert("RGB").resize(target_size, resampling).save(path, format="PNG")
-    print(f"Normalized OpenAI output to source size: {path} ({target_size[0]}x{target_size[1]})", flush=True)
+    print(
+        f"Normalized OpenAI output to source size: {path} ({target_size[0]}x{target_size[1]})",
+        flush=True,
+    )
 
 
 def generate(args: argparse.Namespace, references: list[Path] | None = None) -> Path:
@@ -70,7 +75,9 @@ def generate(args: argparse.Namespace, references: list[Path] | None = None) -> 
     if not source.is_file():
         raise FileNotFoundError(f"Reference source image not found: {source}")
     if source.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
-        raise RuntimeError("OpenAI image edits require a PNG, JPEG, or WebP source image.")
+        raise RuntimeError(
+            "OpenAI image edits require a PNG, JPEG, or WebP source image."
+        )
     token = args.api_key.strip()
     if not token:
         raise RuntimeError("Missing OpenAI API key.")
@@ -78,7 +85,11 @@ def generate(args: argparse.Namespace, references: list[Path] | None = None) -> 
         print(f"Reuse OpenAI reference: {output}", flush=True)
         return output
 
-    reference_paths = [resolve_path(path) for path in (references or []) if resolve_path(path).is_file()]
+    reference_paths = [
+        resolve_path(path)
+        for path in (references or [])
+        if resolve_path(path).is_file()
+    ]
     continuity = ""
     if reference_paths:
         continuity = (
@@ -86,7 +97,11 @@ def generate(args: argparse.Namespace, references: list[Path] | None = None) -> 
             "skin tones, lighting temperature, and overall colour continuity. The first image is the "
             "black-and-white shot to colourise."
         )
-    prompt = " ".join(part.strip() for part in (args.prompt, args.prompt_suffix, continuity, args.add_prompt) if part and part.strip())
+    prompt = " ".join(
+        part.strip()
+        for part in (args.prompt, args.prompt_suffix, continuity, args.add_prompt)
+        if part and part.strip()
+    )
     args.prompt = prompt
     body = build_body(args, source, reference_paths)
     request = urllib.request.Request(
@@ -105,7 +120,9 @@ def generate(args: argparse.Namespace, references: list[Path] | None = None) -> 
     if args.dry_run:
         return output
     try:
-        with urllib.request.urlopen(request, timeout=args.timeout, context=ssl.create_default_context()) as response:
+        with urllib.request.urlopen(
+            request, timeout=args.timeout, context=ssl.create_default_context()
+        ) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         text = exc.read().decode("utf-8", errors="replace")
@@ -137,7 +154,12 @@ def read_manifest(path: Path, enabled_only: bool = True) -> list[dict[str, str]]
             handle.seek(pos)
             reader = csv.DictReader(handle)
             for row in reader:
-                if enabled_only and row.get("enabled", "true").strip().lower() in {"false", "0", "no", "off"}:
+                if enabled_only and row.get("enabled", "true").strip().lower() in {
+                    "false",
+                    "0",
+                    "no",
+                    "off",
+                }:
                     continue
                 rows.append(row)
             break
@@ -152,7 +174,9 @@ def row_target(row: dict[str, str]) -> str:
     return row.get("color_reference") or row.get("reference") or ""
 
 
-def nearby_reference_images(rows: list[dict[str, str]], row_index: int, count: int) -> list[Path]:
+def nearby_reference_images(
+    rows: list[dict[str, str]], row_index: int, count: int
+) -> list[Path]:
     if count <= 0:
         return []
     previous = []
@@ -191,17 +215,25 @@ def generate_manifest(args: argparse.Namespace) -> None:
         source = row_source(row)
         output = row_target(row)
         if not source or not output:
-            raise RuntimeError(f"Manifest row {index} must have source_reference and color_reference.")
+            raise RuntimeError(
+                f"Manifest row {index} must have source_reference and color_reference."
+            )
         child = argparse.Namespace(**vars(args))
         child.source_image = source
         child.output = output
-        child.add_prompt = " ".join(part.strip() for part in (row.get("prompt", ""), args.add_prompt) if part and part.strip())
+        child.add_prompt = " ".join(
+            part.strip()
+            for part in (row.get("prompt", ""), args.add_prompt)
+            if part and part.strip()
+        )
         refs = nearby_reference_images(rows, index, args.reference_count)
         generate(child, refs)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Colorize one reference image with the OpenAI Images API.")
+    parser = argparse.ArgumentParser(
+        description="Colorize one reference image with the OpenAI Images API."
+    )
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--source-image", type=Path)
     parser.add_argument("--output", type=Path)
@@ -229,7 +261,9 @@ def main() -> int:
     elif args.source_image and args.output:
         generate(args)
     else:
-        raise RuntimeError("Provide either --manifest, or both --source-image and --output.")
+        raise RuntimeError(
+            "Provide either --manifest, or both --source-image and --output."
+        )
     return 0
 
 

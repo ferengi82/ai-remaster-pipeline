@@ -10,15 +10,12 @@ import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+from . import app_context
 from .comfy import comfy_busy_message, comfy_is_running, comfy_queue, discover_comfy_instances
 from .config import CONFIG_FILE, ROOT, current_config
 from .http_handler import Handler
 
 STARTED_COMFY_PROCESS: subprocess.Popen | None = None
-
-
-def bind_context(context: dict) -> None:
-    globals().update(context)
 
 
 def ensure_comfy_available_for_stage(stage_title: str) -> tuple[bool, str]:
@@ -48,7 +45,7 @@ def ensure_comfy_available_for_stage(stage_title: str) -> tuple[bool, str]:
 
 def startup_log(message: str) -> None:
     print(message)
-    app = globals().get("APP")
+    app = app_context.APP
     if app is not None:
         app.log.append(message)
 

@@ -4,6 +4,8 @@ import csv
 import io
 from pathlib import Path
 
+import artifact_ids as aid  # scripts/ is on sys.path via the package __init__
+
 
 def read_manifest(path: Path) -> list[dict[str, str]]:
     _source, _fields, rows = read_manifest_details(path)
@@ -75,31 +77,8 @@ def read_outpaint_chunk_rows(path: Path) -> dict[int, dict[str, str]]:
 
 def write_outpaint_chunk_rows(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = [
-        "chunk_index",
-        "start_frame",
-        "end_frame",
-        "start_seconds",
-        "end_seconds",
-        "custom_seconds",
-        "offset_x",
-        "offset_y",
-        "seed",
-        "prompt_suffix",
-        "negative_suffix",
-        "guide_image",
-        "guide_strength",
-        "guide_end_image",
-        "guide_end_strength",
-        "guide_frames",
-        "anchor_image",
-        "anchor_position",
-        "anchor_seconds",
-        "prepared_path",
-        "raw_path",
-    ]
     buffer = io.StringIO(newline="")
-    writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
+    writer = csv.DictWriter(buffer, fieldnames=aid.CHUNK_MANIFEST_FIELDS, extrasaction="ignore")
     writer.writeheader()
     writer.writerows(rows)
     text = buffer.getvalue()

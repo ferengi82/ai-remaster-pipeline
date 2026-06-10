@@ -41,6 +41,50 @@ SCHEMA = 1
 MODEL_SIZE_MULTIPLE = 32
 KEY_LEN = 8
 
+# Column order of the outpaint chunk manifest CSV. Both the producer
+# (scripts/outpaint_video.py) and the GUI (ai_remaster_gui/manifests.py) write this file with
+# DictWriter(extrasaction="ignore"), so a column missing from either copy of the list would be
+# silently dropped on the next rewrite — keep the one list here.
+CHUNK_MANIFEST_FIELDS = (
+    "chunk_index",
+    "start_frame",
+    "end_frame",
+    "start_seconds",
+    "end_seconds",
+    "custom_seconds",
+    "offset_x",
+    "offset_y",
+    "seed",
+    "prompt_suffix",
+    "negative_suffix",
+    "guide_image",
+    "guide_strength",
+    "guide_end_image",
+    "guide_end_strength",
+    "guide_frames",
+    "anchor_image",
+    "anchor_position",
+    "anchor_seconds",
+    "prepared_path",
+    "raw_path",
+)
+
+
+def combine_prompt(prompt: str, suffix: str) -> str:
+    """Join a base prompt and a per-chunk suffix with sentence-aware punctuation.
+
+    Shared by the outpaint script and the GUI so the prompt previewed in the chunk table is
+    byte-identical to the prompt sent to Comfy.
+    """
+    base = (prompt or "").strip()
+    extra = (suffix or "").strip()
+    if not base:
+        return extra
+    if not extra:
+        return base
+    separator = " " if base.endswith((".", "!", "?", ":")) else ". "
+    return f"{base}{separator}{extra}"
+
 
 # ── filename helpers ──────────────────────────────────────────────────────────
 
