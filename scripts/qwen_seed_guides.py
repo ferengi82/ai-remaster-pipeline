@@ -25,6 +25,7 @@ import numpy as np
 import generate_references as gr
 from common import ROOT, root_relative
 from guide_frame_utils import resize_frame_for_qwen, save_edge_mask_for_frame
+from common import DATA_ROOT
 
 DEFAULT_SEED_PROMPT = "Replace the black bars."
 
@@ -152,7 +153,7 @@ def seed_guides(
     """
     boundaries = detect_shot_start_frames(prepared, sample_seconds, shot_threshold, min_shot_seconds)
     print(f"Seed guides: detected {len(boundaries)} shot start(s) in the prepared canvas.", flush=True)
-    out_dir = ROOT / "intermediate" / "outpaint_seed_guides" / manifest_stem
+    out_dir = DATA_ROOT / "intermediate" / "outpaint_seed_guides" / manifest_stem
     cap = cv2.VideoCapture(str(prepared))
     cache: dict[int, Path | None] = {}
     result: dict[int, list[dict]] = {}

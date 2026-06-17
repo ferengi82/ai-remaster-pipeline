@@ -13,9 +13,10 @@ from pathlib import Path
 from .comfy import comfy_busy_message, comfy_is_running, comfy_queue, discover_comfy_instances
 from .config import CONFIG_FILE, ROOT, current_config
 from .http_handler import Handler
+from .config import DATA_ROOT
 
 STARTED_COMFY_PROCESS: subprocess.Popen | None = None
-COMFY_STARTUP_LOG = ROOT / "output" / "logs" / "comfyui-startup.log"
+COMFY_STARTUP_LOG = DATA_ROOT / "output" / "logs" / "comfyui-startup.log"
 
 
 def bind_context(context: dict) -> None:

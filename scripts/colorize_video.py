@@ -23,6 +23,8 @@ from common import (
     video_info,
     write_signature,
 )
+from common import DATA_ROOT
+from common import CACHE_ROOT
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 
@@ -72,7 +74,7 @@ def default_output(manifest: Path, manifest_source: str | None, method: str) -> 
     # drifted from the artifact-id scheme and left "both" outputs invisible to the GUI.
     ident = aid.colorized_identity(manifest.stem, method)
     name_src = Path(manifest_source).name if manifest_source else manifest.name
-    return ROOT / "intermediate" / "outpainted_colorized" / aid.artifact_name(aid.source_word(name_src), "color", ident, "mp4")
+    return DATA_ROOT / "intermediate" / "outpainted_colorized" / aid.artifact_name(aid.source_word(name_src), "color", ident, "mp4")
 
 
 def reference_signature(row: dict[str, str]) -> dict[str, Any]:
@@ -441,7 +443,7 @@ def stitch_colorized(ffmpeg: str, chunks: list[Path], transitions: list[int], ou
         return
 
     group_outputs: list[Path] = []
-    group_dir = ROOT / ".cache" / "colorized_chunks" / "crossfaded" / source_stem
+    group_dir = CACHE_ROOT / "colorized_chunks" / "crossfaded" / source_stem
     group_dir.mkdir(parents=True, exist_ok=True)
     for group_index, (left, right) in enumerate(transition_groups(transitions)):
         group_chunks = chunks[left : right + 1]
@@ -533,7 +535,7 @@ def run(args: argparse.Namespace) -> int:
 
     chunks: list[Path] = []
     plan, transitions = shot_plan(rows, total_frames, fps)
-    cache_dir = ROOT / ".cache" / "colorized_chunks" / method_suffix(args.method) / safe_stem(source_video.name)
+    cache_dir = CACHE_ROOT / "colorized_chunks" / method_suffix(args.method) / safe_stem(source_video.name)
     cache_dir.mkdir(parents=True, exist_ok=True)
     for index, row in enumerate(rows):
         item = plan[index]

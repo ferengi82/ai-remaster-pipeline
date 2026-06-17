@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from common import QWEN_IMAGE_EDIT_MODEL, ROOT
+from common import CACHE_ROOT
 
 
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
@@ -61,7 +62,7 @@ SFX_MODELS = [
 
 
 def ensure_ffmpeg_tools() -> tuple[Path, Path]:
-    tool_dir = ROOT / ".cache" / "tools" / "ffmpeg"
+    tool_dir = CACHE_ROOT / "tools" / "ffmpeg"
     ffmpeg = tool_dir / "ffmpeg.exe"
     ffprobe = tool_dir / "ffprobe.exe"
     if ffmpeg.exists() and ffprobe.exists():
@@ -73,7 +74,7 @@ def ensure_ffmpeg_tools() -> tuple[Path, Path]:
             return Path(found_ffmpeg), Path(found_ffprobe)
         raise FileNotFoundError("ffmpeg/ffprobe were not found. Automatic FFmpeg download is currently implemented for Windows.")
 
-    archive = ROOT / ".cache" / "downloads" / "ffmpeg-release-essentials.zip"
+    archive = CACHE_ROOT / "downloads" / "ffmpeg-release-essentials.zip"
     archive.parent.mkdir(parents=True, exist_ok=True)
     tool_dir.mkdir(parents=True, exist_ok=True)
     if not archive.exists():
@@ -110,7 +111,7 @@ def ensure_hf_models(comfy_dir: Path, models: list[HfModel], required: bool = Tr
     """
     ensure_huggingface_hub()
 
-    cache_root = ROOT / ".cache" / "huggingface"
+    cache_root = CACHE_ROOT / "huggingface"
     cache_root.mkdir(parents=True, exist_ok=True)
     old_python_utf8 = os.environ.get("PYTHONUTF8")
     old_python_io = os.environ.get("PYTHONIOENCODING")

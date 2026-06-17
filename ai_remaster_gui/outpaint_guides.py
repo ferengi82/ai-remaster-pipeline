@@ -12,6 +12,7 @@ from .manifests import read_outpaint_chunk_rows, write_outpaint_chunk_rows
 from .media import extract_video_frame_at
 from .paths import rel, resolve, resolve_video_source
 from .sam_masks import sam2_mask_for_image
+from .config import DATA_ROOT
 
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
@@ -132,7 +133,7 @@ def guide_frame_generation_command(chunk_index: int, guide_index: int, frame_idx
         raise FileNotFoundError(f"Could not extract source frame for Qwen guide at {source_seconds:.3f}s from {range_source}.")
 
     manifest = resolve(str(manifest_text))
-    output_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem
+    output_dir = DATA_ROOT / "intermediate" / "outpaint_guides" / manifest.stem
     output = output_dir / f"chunk_{chunk_index:04d}_guide_{guide_index:02d}_qwen.png"
     output_dir.mkdir(parents=True, exist_ok=True)
     remove_cached_file(output)
@@ -300,7 +301,7 @@ def outpaint_guide_generation_command(index: int, prompt: str) -> tuple[list[str
         raise FileNotFoundError(f"Could not extract source frame for Qwen guide at {guide_source_seconds:.3f}s from {range_source}.")
 
     manifest = resolve(str(manifest_text))
-    output_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem
+    output_dir = DATA_ROOT / "intermediate" / "outpaint_guides" / manifest.stem
     output = output_dir / f"chunk_{index:04d}_guide_qwen.png"
     output_dir.mkdir(parents=True, exist_ok=True)
     remove_cached_file(output)
@@ -341,7 +342,7 @@ def outpaint_end_guide_generation_command(index: int, prompt: str) -> tuple[list
         raise FileNotFoundError(f"Could not extract source frame for Qwen end guide at {guide_source_seconds:.3f}s from {range_source}.")
 
     manifest = resolve(str(manifest_text))
-    output_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem
+    output_dir = DATA_ROOT / "intermediate" / "outpaint_guides" / manifest.stem
     output = output_dir / f"chunk_{index:04d}_guide_end_qwen.png"
     output_dir.mkdir(parents=True, exist_ok=True)
     remove_cached_file(output)
@@ -419,7 +420,7 @@ def upload_guide_frame_image(chunk_index: int, guide_index: int) -> dict:
     source = resolve(selected)
     if source.suffix.lower() not in IMAGE_EXTS:
         raise RuntimeError("Choose a PNG or JPEG image for the guide frame.")
-    target_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem
+    target_dir = DATA_ROOT / "intermediate" / "outpaint_guides" / manifest.stem
     target = target_dir / f"chunk_{chunk_index:04d}_guide_{guide_index:02d}{source.suffix.lower()}"
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)
@@ -445,7 +446,7 @@ def clear_guide_frame_image(chunk_index: int, guide_index: int) -> dict:
     return {"image": ""}
 
 def _guide_edit_dir(manifest: Path, chunk_index: int, guide_index: int) -> Path:
-    return ROOT / "intermediate" / "outpaint_guides" / manifest.stem / "edits" / f"chunk_{chunk_index:04d}_guide_{guide_index:02d}"
+    return DATA_ROOT / "intermediate" / "outpaint_guides" / manifest.stem / "edits" / f"chunk_{chunk_index:04d}_guide_{guide_index:02d}"
 
 def _next_guide_edit_output(manifest: Path, chunk_index: int, guide_index: int) -> Path:
     folder = _guide_edit_dir(manifest, chunk_index, guide_index)

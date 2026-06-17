@@ -12,6 +12,7 @@ from .manifests import read_manifest, read_manifest_details, update_manifest_row
 from .media import extract_video_frame_at
 from .paths import rel, resolve, safe_stem
 from .sam_masks import sam2_mask_for_image
+from .config import DATA_ROOT
 
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
@@ -27,7 +28,7 @@ def recomposition_output_for(outpainted_text: str) -> str:
         return ""
     outpainted = resolve(outpainted_text)
     ident = aid.recomp_identity(outpainted.stem)
-    return rel(ROOT / "output" / "reassembled" / aid.artifact_name(aid.source_word(outpainted.name), "recomp", ident, "mp4"))
+    return rel(DATA_ROOT / "output" / "reassembled" / aid.artifact_name(aid.source_word(outpainted.name), "recomp", ident, "mp4"))
 
 def colorized_outputs_for_manifest(manifest_text: str, method: str = "deepexemplar") -> list[str]:
     if method == "both":
@@ -44,7 +45,7 @@ def colorized_output_for_manifest(manifest_text: str, method: str = "deepexempla
     ident = aid.colorized_identity(manifest.stem, method)
     source_video = manifest_source_video(manifest)
     name_src = resolve(source_video).name if source_video else manifest.name
-    return rel(ROOT / "intermediate" / "outpainted_colorized" / aid.artifact_name(aid.source_word(name_src), "color", ident, "mp4"))
+    return rel(DATA_ROOT / "intermediate" / "outpainted_colorized" / aid.artifact_name(aid.source_word(name_src), "color", ident, "mp4"))
 
 def color_reference_outputs(manifest_text: str) -> list[str]:
     if not manifest_text:
@@ -137,7 +138,7 @@ def recent_color_references(rows: list[dict[str, str]], row_index: int, limit: i
 
 def reference_edit_dir(manifest_text: str, index: int) -> Path:
     stem = safe_stem(resolve(manifest_text).stem or "references")
-    return ROOT / "intermediate" / "outpainted_references_color_edits" / stem / f"shot_{index:04d}"
+    return DATA_ROOT / "intermediate" / "outpainted_references_color_edits" / stem / f"shot_{index:04d}"
 
 def reference_edit_versions(manifest_text: str, index: int, limit: int = 8) -> list[str]:
     folder = reference_edit_dir(manifest_text, index)
@@ -403,8 +404,8 @@ def reference_name_for_time(index: int, seconds: float) -> str:
 def color_reference_for_source(source_reference: str) -> str:
     source = resolve(source_reference)
     try:
-        relative = source.relative_to(ROOT / "intermediate" / "outpainted_references")
-        return rel(ROOT / "intermediate" / "outpainted_references_color" / relative)
+        relative = source.relative_to(DATA_ROOT / "intermediate" / "outpainted_references")
+        return rel(DATA_ROOT / "intermediate" / "outpainted_references_color" / relative)
     except ValueError:
         return rel(source.with_name(source.stem + "_color" + source.suffix))
 
@@ -449,7 +450,7 @@ def install_custom_color_reference(manifest_text: str, index: int) -> dict[str, 
     elif rows[index].get("source_reference"):
         target = resolve(color_reference_for_source(rows[index]["source_reference"])).with_suffix(source.suffix.lower())
     else:
-        target = ROOT / "intermediate" / "outpainted_references_color" / "custom" / f"shot_{index + 1:04d}{source.suffix.lower()}"
+        target = DATA_ROOT / "intermediate" / "outpainted_references_color" / "custom" / f"shot_{index + 1:04d}{source.suffix.lower()}"
 
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)
@@ -469,7 +470,7 @@ def extract_reference_frame(manifest_text: str, index: int, seconds: float) -> d
         folder = resolve(old_reference).parent
     else:
         source = resolve(source_video)
-        folder = ROOT / "intermediate" / "outpainted_references" / safe_stem(source.name)
+        folder = DATA_ROOT / "intermediate" / "outpainted_references" / safe_stem(source.name)
     new_source = folder / reference_name_for_time(index, seconds)
     ffmpeg = local_tool("ffmpeg")
     if not ffmpeg:

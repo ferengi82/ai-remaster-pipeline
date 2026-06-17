@@ -7,10 +7,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 from common import ROOT, file_fingerprint, format_time, resolve_path, root_relative, safe_stem, resumable_output, write_signature
+from common import DATA_ROOT
 
-DEFAULT_REFERENCE_ROOT = ROOT / 'intermediate' / 'outpainted_references'
-DEFAULT_COLOR_REFERENCE_ROOT = ROOT / 'intermediate' / 'outpainted_references_color'
-DEFAULT_MANIFEST_ROOT = ROOT / 'manifests' / 'references'
+DEFAULT_REFERENCE_ROOT = DATA_ROOT / 'intermediate' / 'outpainted_references'
+DEFAULT_COLOR_REFERENCE_ROOT = DATA_ROOT / 'intermediate' / 'outpainted_references_color'
+DEFAULT_MANIFEST_ROOT = DATA_ROOT / 'manifests' / 'references'
 
 @dataclass
 class VideoInfo:

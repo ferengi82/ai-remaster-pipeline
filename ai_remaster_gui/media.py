@@ -13,6 +13,8 @@ from .cache import human_size
 from .config import ASPECT_PREVIEW_DIR, FILE_PREVIEW_DIR, IMAGE_EXTS, MEDIA_CLIP_DIR, PREVIEW_DIR, ROOT, SCRIPTS, VIDEO_EXTS
 from .paths import parse_aspect, rel, resolve, resolve_video_source, safe_stem
 from .project_io import source_analysis_key, source_signature
+from .config import DATA_ROOT
+from .config import CACHE_ROOT
 
 SOURCE_PREVIEW_COUNT = 3
 ASPECT_PREVIEW_STYLE_VERSION = 4
@@ -564,7 +566,7 @@ def video_metrics(source: Path) -> dict[str, float]:
 
 def local_tool(name: str) -> str | None:
     exe = f"{name}.exe" if os.name == "nt" else name
-    local = ROOT / ".cache" / "tools" / "ffmpeg" / exe
+    local = CACHE_ROOT / "tools" / "ffmpeg" / exe
     if local.exists():
         return str(local)
     return shutil.which(name)
@@ -736,7 +738,7 @@ def source_section_output_for(settings: dict) -> Path:
     start = section_float(global_settings.get("section_start", "0"), 0.0)
     end = section_float(global_settings.get("section_end", ""), 0.0)
     suffix = f"{int(round(start * 1000)):010d}_{int(round(end * 1000)):010d}"
-    return ROOT / "intermediate" / "source_sections" / f"{safe_stem(source.name)}_{suffix}{source.suffix or '.mp4'}"
+    return DATA_ROOT / "intermediate" / "source_sections" / f"{safe_stem(source.name)}_{suffix}{source.suffix or '.mp4'}"
 
 def source_section_is_active(settings: dict) -> bool:
     global_settings = settings.get("global", {})

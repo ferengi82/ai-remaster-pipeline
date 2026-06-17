@@ -10,6 +10,8 @@ from typing import Any
 
 from comfy_api import ensure_node_types, extract_output_files, object_info, queue_prompt, wait_for_comfy, wait_for_prompt
 from common import ROOT, copy_to_comfy_input, file_fingerprint, find_ffmpeg, load_local_config, newest_output as newest_comfy_output, replace_unless_identical, replace_with_retry, resolve_path, root_relative, safe_stem, resumable_output, split_matches_source, video_info, write_signature, write_split_sidecar
+from common import DATA_ROOT
+from common import CACHE_ROOT
 
 
 config = load_local_config()
@@ -17,7 +19,7 @@ config = load_local_config()
 
 def default_output(source: Path, width: int, height: int) -> Path:
     suffix = f"flashvsr_{width}x{height}" if width and height else "flashvsr"
-    return ROOT / "output" / "upscaled" / f"{safe_stem(source.name)}_{suffix}.mp4"
+    return DATA_ROOT / "output" / "upscaled" / f"{safe_stem(source.name)}_{suffix}.mp4"
 
 
 # The legacy single-node workflow hardcoded these values, so leaving a knob at its
@@ -360,7 +362,7 @@ def chunked_flashvsr_run(args: argparse.Namespace, source: Path, output: Path, o
         replace_with_retry(final_partial, output, "Upscaled output")
         return
 
-    chunk_dir = ROOT / ".cache" / "upscale_chunks" / f"{safe_stem(source.name)}_flashvsr_{output_width}x{output_height}_{int(args.chunk_seconds * 1000)}ms_ov{max(0, args.overlap_frames)}"
+    chunk_dir = CACHE_ROOT / "upscale_chunks" / f"{safe_stem(source.name)}_flashvsr_{output_width}x{output_height}_{int(args.chunk_seconds * 1000)}ms_ov{max(0, args.overlap_frames)}"
     chunk_dir.mkdir(parents=True, exist_ok=True)
     print(f"Splitting upscaling into {len(ranges)} chunk(s): {args.chunk_seconds:g}s chunks, {max(0, args.overlap_frames)} overlap frame(s)", flush=True)
     normalized_chunks: list[Path] = []

@@ -4,6 +4,8 @@ from pathlib import Path
 
 from .config import ASPECT_PREVIEW_DIR, FILE_PREVIEW_DIR, MEDIA_CLIP_DIR, PREVIEW_DIR, ROOT
 from .paths import rel, resolve
+from .config import DATA_ROOT
+from .config import CACHE_ROOT
 
 
 def bind_context(context: dict) -> None:
@@ -29,7 +31,7 @@ def cache_categories() -> tuple[dict, ...]:
                 FILE_PREVIEW_DIR,
                 ASPECT_PREVIEW_DIR,
                 MEDIA_CLIP_DIR,
-                ROOT / "intermediate" / "source_sections",
+                DATA_ROOT / "intermediate" / "source_sections",
             ),
         },
         {
@@ -37,27 +39,27 @@ def cache_categories() -> tuple[dict, ...]:
             "title": "Outpainting",
             "description": "Prepared inputs, guide frames, per-chunk LTX renders, chunk manifests, and stitched outpainted videos.",
             "folders": (
-                ROOT / ".cache" / "outpaint_chunks",
-                ROOT / "intermediate" / "outpaint_guides",
-                ROOT / "intermediate" / "outpaint_anchors",  # legacy name
-                ROOT / "intermediate" / "outpaint_prepared",
-                ROOT / "intermediate" / "outpainted",
-                ROOT / "manifests" / "outpaint_chunks",
+                CACHE_ROOT / "outpaint_chunks",
+                DATA_ROOT / "intermediate" / "outpaint_guides",
+                DATA_ROOT / "intermediate" / "outpaint_anchors",  # legacy name
+                DATA_ROOT / "intermediate" / "outpaint_prepared",
+                DATA_ROOT / "intermediate" / "outpainted",
+                DATA_ROOT / "manifests" / "outpaint_chunks",
             ),
         },
         {
             "key": "shots",
             "title": "Shot Detection",
             "description": "Shot manifests created by cut detection.",
-            "folders": (ROOT / "manifests" / "references",),
+            "folders": (DATA_ROOT / "manifests" / "references",),
         },
         {
             "key": "references",
             "title": "Reference Generation",
             "description": "Black-and-white shot screenshots and Qwen color reference stills.",
             "folders": (
-                ROOT / "intermediate" / "outpainted_references",
-                ROOT / "intermediate" / "outpainted_references_color",
+                DATA_ROOT / "intermediate" / "outpainted_references",
+                DATA_ROOT / "intermediate" / "outpainted_references_color",
             ),
         },
         {
@@ -65,8 +67,8 @@ def cache_categories() -> tuple[dict, ...]:
             "title": "Colorization",
             "description": "Per-shot colorized chunks and stitched Deep Exemplar colorized videos.",
             "folders": (
-                ROOT / ".cache" / "colorized_chunks",
-                ROOT / "intermediate" / "outpainted_colorized",
+                CACHE_ROOT / "colorized_chunks",
+                DATA_ROOT / "intermediate" / "outpainted_colorized",
             ),
         },
         {
@@ -79,7 +81,7 @@ def cache_categories() -> tuple[dict, ...]:
             "key": "output",
             "title": "Output",
             "description": "Finished output movies shown on the Output tab.",
-            "folders": (ROOT / "output" / "reassembled",),
+            "folders": (DATA_ROOT / "output" / "reassembled",),
         },
     )
 

@@ -7,10 +7,11 @@ from pathlib import Path
 
 import qwen_colorize_references as qwen
 from common import ROOT, resolve_path, root_relative
+from common import DATA_ROOT
 
 
 def write_temp_manifest(source: Path, output: Path) -> Path:
-    temp_dir = ROOT / 'manifests' / '_single_reference_tmp'
+    temp_dir = DATA_ROOT / 'manifests' / '_single_reference_tmp'
     temp_dir.mkdir(parents=True, exist_ok=True)
     handle = tempfile.NamedTemporaryFile('w', encoding='utf-8', newline='', suffix='.csv', prefix='single_reference_', dir=temp_dir, delete=False)
     with handle:

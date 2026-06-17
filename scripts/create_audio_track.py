@@ -42,6 +42,7 @@ from common import (
 )
 
 import audio_models
+from common import CACHE_ROOT
 
 config = load_local_config()
 
@@ -493,7 +494,7 @@ def run(args: argparse.Namespace) -> int:
     print("Waiting for ComfyUI", flush=True)
     wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
 
-    work_dir = ROOT / ".cache" / "audio" / safe_stem(source.name)
+    work_dir = CACHE_ROOT / "audio" / safe_stem(source.name)
     work_dir.mkdir(parents=True, exist_ok=True)
 
     music_stem = build_music_stem(args, ffmpeg, source, duration, work_dir, captioner) if args.music else None

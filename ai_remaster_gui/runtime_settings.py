@@ -18,6 +18,7 @@ from .config import (
 )
 from .models import STAGES
 from .paths import newest, rel, resolve
+from .config import DATA_ROOT
 
 
 def app_version() -> str:
@@ -128,7 +129,7 @@ def load_settings() -> dict[str, dict[str, str]]:
                     defaults[key].update({k: str(v) for k, v in values.items()})
         except json.JSONDecodeError:
             pass
-    source = newest_fn(ROOT / "input", VIDEO_EXTS)
+    source = newest_fn(DATA_ROOT / "input", VIDEO_EXTS)
     if source and not defaults["global"].get("source"):
         defaults["global"]["source"] = rel(source)
     if not defaults["global"].get("source"):

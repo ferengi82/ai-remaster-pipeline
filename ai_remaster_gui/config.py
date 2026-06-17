@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# Data directories (input / intermediate / output / manifests) can be relocated off the code
+# tree via ARP_DATA_DIR. Defaults to ROOT so existing layouts are unchanged. Resolved so
+# downstream tools (ffmpeg, ComfyUI) receive a real path rather than a symlink (some network
+# filesystems fail ffmpeg's +faststart reopen when the output path traverses a symlink).
+DATA_ROOT = Path(os.environ.get("ARP_DATA_DIR") or ROOT).resolve()
+# Regenerable caches relocatable via ARP_CACHE_DIR (defaults to ROOT/.cache). Resolved for the
+# same symlink/+faststart reason as DATA_ROOT.
+CACHE_ROOT = Path(os.environ.get("ARP_CACHE_DIR") or (ROOT / ".cache")).resolve()
 SCRIPTS = ROOT / "scripts"
 SETTINGS_FILE = ROOT / ".ai_remaster_gui.json"
 CONFIG_FILE = ROOT / ".ai_remaster_config.json"
-PREVIEW_DIR = ROOT / ".cache" / "previews"
-FILE_PREVIEW_DIR = ROOT / ".cache" / "file_previews"
-ASPECT_PREVIEW_DIR = ROOT / ".cache" / "aspect_previews"
-MEDIA_CLIP_DIR = ROOT / ".cache" / "media_clips"
+PREVIEW_DIR = CACHE_ROOT / "previews"
+FILE_PREVIEW_DIR = CACHE_ROOT / "file_previews"
+ASPECT_PREVIEW_DIR = CACHE_ROOT / "aspect_previews"
+MEDIA_CLIP_DIR = CACHE_ROOT / "media_clips"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}

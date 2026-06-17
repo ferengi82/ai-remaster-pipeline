@@ -15,7 +15,12 @@ WORKSPACE="${ARP_WORKSPACE:-/workspace}"
 SENTINEL="$WORKSPACE/.arp_initialized"
 
 # --- Runtime env for the GUI / ComfyUI -------------------------------------
-export HF_HOME="${HF_HOME:-$WORKSPACE/hf-cache}"
+# ARP data + caches live directly on the volume as REAL paths (not symlinks): some
+# network filesystems fail ffmpeg's +faststart reopen when the output path traverses a
+# symlink. ARP_DATA_DIR / ARP_CACHE_DIR make the code use these real paths.
+export ARP_DATA_DIR="${ARP_DATA_DIR:-$WORKSPACE/arp-data}"
+export ARP_CACHE_DIR="${ARP_CACHE_DIR:-$WORKSPACE/arp-cache}"
+export HF_HOME="${HF_HOME:-$ARP_CACHE_DIR/huggingface}"
 export AI_REMASTER_GUI_HOST="${AI_REMASTER_GUI_HOST:-0.0.0.0}"
 export AI_REMASTER_GUI_PORT="${AI_REMASTER_GUI_PORT:-8765}"
 export AI_REMASTER_NO_BROWSER=1
@@ -61,23 +66,19 @@ init_volume() {
     "$WORKSPACE"/models/vae \
     "$WORKSPACE"/models/latent_upscale_models \
     "$WORKSPACE"/models/mmaudio \
-    "$WORKSPACE"/arp-data/input \
-    "$WORKSPACE"/arp-data/intermediate \
-    "$WORKSPACE"/arp-data/manifests \
-    "$WORKSPACE"/arp-data/output \
-    "$WORKSPACE"/hf-cache \
-    "$WORKSPACE"/arp-cache
+    "$ARP_DATA_DIR"/input \
+    "$ARP_DATA_DIR"/intermediate \
+    "$ARP_DATA_DIR"/manifests \
+    "$ARP_DATA_DIR"/output \
+    "$ARP_CACHE_DIR"/huggingface
 
   # Models: download target of dependency_manager AND ComfyUI's load path both
-  # resolve to <comfy>/models -> persistent volume.
+  # resolve to <comfy>/models -> persistent volume. (A symlink is fine here: model
+  # files are written by plain copy/download, not by ffmpeg's +faststart reopen.)
   link "$WORKSPACE/models" "$COMFY_DIR/models"
 
-  # ARP user data + caches persist across restarts.
-  link "$WORKSPACE/arp-data/input"        "$ARP_ROOT/input"
-  link "$WORKSPACE/arp-data/intermediate" "$ARP_ROOT/intermediate"
-  link "$WORKSPACE/arp-data/manifests"    "$ARP_ROOT/manifests"
-  link "$WORKSPACE/arp-data/output"       "$ARP_ROOT/output"
-  link "$WORKSPACE/arp-cache"             "$ARP_ROOT/.cache"
+  # ARP data + caches are used directly via ARP_DATA_DIR / ARP_CACHE_DIR (real volume
+  # paths) — no symlinks into the code tree, so ffmpeg +faststart works on the volume.
 
   write_config
 
@@ -121,14 +122,11 @@ if [ ! -e "$SENTINEL" ]; then
   date -u +"%Y-%m-%dT%H:%M:%SZ" > "$SENTINEL"
   log "First-boot setup complete."
 else
-  log "Volume already initialized ($SENTINEL); refreshing config + symlinks."
-  # Re-assert symlinks/config in case the image was rebuilt with changes.
+  log "Volume already initialized ($SENTINEL); refreshing config + model symlink."
+  # Re-assert the models symlink + config in case the image was rebuilt with changes.
+  mkdir -p "$ARP_DATA_DIR"/input "$ARP_DATA_DIR"/intermediate \
+           "$ARP_DATA_DIR"/manifests "$ARP_DATA_DIR"/output "$ARP_CACHE_DIR"/huggingface
   link "$WORKSPACE/models" "$COMFY_DIR/models"
-  link "$WORKSPACE/arp-data/input"        "$ARP_ROOT/input"
-  link "$WORKSPACE/arp-data/intermediate" "$ARP_ROOT/intermediate"
-  link "$WORKSPACE/arp-data/manifests"    "$ARP_ROOT/manifests"
-  link "$WORKSPACE/arp-data/output"       "$ARP_ROOT/output"
-  link "$WORKSPACE/arp-cache"             "$ARP_ROOT/.cache"
   write_config
 fi
 

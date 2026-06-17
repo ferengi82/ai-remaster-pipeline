@@ -12,6 +12,18 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Data directories (input / intermediate / output / manifests) can be relocated off the code
+# tree via ARP_DATA_DIR. Defaults to ROOT so existing layouts are unchanged. The value is
+# resolved so downstream tools (ffmpeg, ComfyUI) always receive a real path rather than a
+# symlink — some network filesystems (e.g. RunPod volumes) fail ffmpeg's +faststart reopen
+# when the output path traverses a symlink.
+DATA_ROOT = Path(os.environ.get("ARP_DATA_DIR") or ROOT).resolve()
+
+# Regenerable caches (previews, media clips, chunk work dirs, the Hugging Face download cache)
+# can be relocated via ARP_CACHE_DIR. Defaults to ROOT/.cache. Resolved for the same
+# symlink/+faststart reason as DATA_ROOT.
+CACHE_ROOT = Path(os.environ.get("ARP_CACHE_DIR") or (ROOT / ".cache")).resolve()
+
 # The single Qwen Image Edit model used everywhere we run Qwen (colour references, outpaint
 # guide frames, and shot-change seed guides). Mirrors ai_remaster_gui.config.QWEN_IMAGE_EDIT_MODEL
 # (the GUI and scripts are separate packages, so each keeps its own copy of the value).
@@ -163,7 +175,7 @@ def find_ffmpeg(explicit: str | None = None) -> str:
     if explicit:
         candidates.append(Path(explicit))
     exe = "ffmpeg.exe" if is_windows() else "ffmpeg"
-    candidates.extend([ROOT / ".cache" / "tools" / "ffmpeg" / exe, Path("ffmpeg")])
+    candidates.extend([CACHE_ROOT / "tools" / "ffmpeg" / exe, Path("ffmpeg")])
     if is_windows():
         candidates.append(Path("C:/Program Files/ffmpeg/bin/ffmpeg.exe"))
     for candidate in candidates:

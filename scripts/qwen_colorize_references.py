@@ -13,6 +13,7 @@ from typing import Any
 from comfy_api import extract_output_files, node_by_id, queue_prompt, set_widget, wait_for_comfy, wait_for_prompt, widget_fallback_inputs, workflow_to_prompt, http_json
 from common import QWEN_IMAGE_EDIT_MODEL, ROOT, copy_to_comfy_input, file_fingerprint, load_local_config, newest_output, resolve_path, root_relative, resumable_output, write_signature
 from dependency_manager import ensure_qwen_image_edit_models
+from common import DATA_ROOT
 
 DEFAULT_PROMPT = (
     'Colorize this image. Preserve the drawing and composition. '
@@ -21,7 +22,7 @@ DEFAULT_PROMPT = (
 DEFAULT_PROMPT_SUFFIX = (
     'Keep black ink deep, whites clean, and props/backgrounds naturally coloured.'
 )
-DEFAULT_OUTPUT_ROOT = ROOT / 'intermediate' / 'outpainted_references_color'
+DEFAULT_OUTPUT_ROOT = DATA_ROOT / 'intermediate' / 'outpainted_references_color'
 DEFAULT_OLLAMA_URL = 'http://127.0.0.1:11434'
 DEFAULT_OLLAMA_VISION_MODEL = 'qwen2.5vl:7b'
 REFERENCE_DESCRIPTION_PROMPT = (

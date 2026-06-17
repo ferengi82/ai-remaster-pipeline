@@ -34,6 +34,8 @@ from prepare_outpaint_input import default_output as default_prepared_output
 from prepare_outpaint_input import even, parse_aspect, probe_video
 from qwen_seed_guides import DEFAULT_SEED_PROMPT, seed_guides
 import artifact_ids as aid
+from common import DATA_ROOT
+from common import CACHE_ROOT
 
 
 def _crop_black(args: Any | None) -> tuple[list[int], bool]:
@@ -87,13 +89,13 @@ def crop_slug(args: Any) -> str:
 def default_output(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
     width, height = model_safe_size(source, aspect, target_height)
     crop, black = _crop_black(args)
-    return ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "outpaint", "mp4")
+    return DATA_ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "outpaint", "mp4")
 
 
 def default_raw_output(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
     width, height = model_safe_size(source, aspect, target_height)
     crop, black = _crop_black(args)
-    return ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "rawcomfy", "mp4")
+    return DATA_ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "rawcomfy", "mp4")
 
 
 def prepared_for(source: Path, aspect: str, target_height: int | None, args: Any | None = None) -> Path:
@@ -103,7 +105,7 @@ def prepared_for(source: Path, aspect: str, target_height: int | None, args: Any
     # dimensions (e.g. 704) to delivery resolution (e.g. 720) when producing the final master.
     work_w, work_h = model_safe_size(source, aspect, target_height)
     crop, black = _crop_black(args)
-    return ROOT / "intermediate" / "outpaint_prepared" / aid.outpaint_name(source.name, aspect, work_w, work_h, crop, black, "prepared", "mp4")
+    return DATA_ROOT / "intermediate" / "outpaint_prepared" / aid.outpaint_name(source.name, aspect, work_w, work_h, crop, black, "prepared", "mp4")
 
 
 def run_command(command: list[str], dry_run: bool) -> None:
@@ -803,7 +805,7 @@ def combine_prompt(prompt: str, suffix: str) -> str:
 
 def default_chunk_manifest(source: Path, aspect: str, width: int, height: int, args) -> Path:
     crop, black = _crop_black(args)
-    return ROOT / "manifests" / "outpaint_chunks" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "chunks", "csv")
+    return DATA_ROOT / "manifests" / "outpaint_chunks" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "chunks", "csv")
 
 
 def read_chunk_manifest(path: Path) -> dict[int, dict[str, str]]:
@@ -1336,7 +1338,7 @@ def main() -> int:
     if not args.dry_run:
         ffmpeg = find_ffmpeg()
         chunk_crop, chunk_black = _crop_black(args)
-        chunk_dir = ROOT / ".cache" / "outpaint_chunks" / aid.outpaint_basename(source.name, args.target_aspect, work_width, work_height, chunk_crop, chunk_black, "chunks")
+        chunk_dir = CACHE_ROOT / "outpaint_chunks" / aid.outpaint_basename(source.name, args.target_aspect, work_width, work_height, chunk_crop, chunk_black, "chunks")
         chunk_manifest = resolve_path(args.chunk_manifest) if args.chunk_manifest else default_chunk_manifest(source, args.target_aspect, work_width, work_height, args)
         prepared_info = probe_video(prepared)
         chunk_existing = read_chunk_manifest(chunk_manifest)
