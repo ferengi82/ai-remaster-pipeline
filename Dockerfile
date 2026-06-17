@@ -30,6 +30,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.13 python3.13-venv python3.13-dev \
  && rm -rf /var/lib/apt/lists/*
 
+# --- miniserve: simple web file manager for /workspace (single static binary) -
+ARG MINISERVE_VERSION=0.29.0
+RUN curl -fsSL -o /usr/local/bin/miniserve \
+        "https://github.com/svenstaro/miniserve/releases/download/v${MINISERVE_VERSION}/miniserve-${MINISERVE_VERSION}-x86_64-unknown-linux-musl" \
+ && chmod +x /usr/local/bin/miniserve \
+ && miniserve --version
+
 # --- Python venv ------------------------------------------------------------
 RUN python3.13 -m venv /opt/venv \
  && pip install --upgrade pip setuptools wheel
@@ -67,6 +74,6 @@ ENV ARP_ROOT=/opt/arp \
     COMFY_DIR=/opt/comfyui \
     ARP_WORKSPACE=/workspace
 
-EXPOSE 8765 8188
+EXPOSE 8765 8188 8888
 WORKDIR /opt/arp
 ENTRYPOINT ["/opt/arp/docker/entrypoint.sh"]

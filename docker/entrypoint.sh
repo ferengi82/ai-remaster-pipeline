@@ -132,6 +132,31 @@ else
   write_config
 fi
 
+start_filemanager() {
+  if [ "${ARP_ENABLE_FILES:-1}" = "0" ]; then
+    log "File manager disabled (ARP_ENABLE_FILES=0)."
+    return
+  fi
+  if ! command -v miniserve >/dev/null 2>&1; then
+    log "miniserve not found; skipping file manager."
+    return
+  fi
+  local port="${ARP_FILES_PORT:-8888}"
+  local auth_args=()
+  if [ -n "${ARP_FILES_AUTH:-}" ]; then
+    auth_args=(--auth "$ARP_FILES_AUTH")   # format USER:PASSWORD
+    log "Starting file manager on 0.0.0.0:${port} (auth enabled) -> $WORKSPACE"
+  else
+    log "Starting file manager on 0.0.0.0:${port} (NO AUTH) -> $WORKSPACE"
+  fi
+  # -u upload, -U mkdir, -o overwrite, -H show hidden files.
+  miniserve "$WORKSPACE" -i 0.0.0.0 -p "$port" -u -U -o -H "${auth_args[@]}" \
+    >> "$WORKSPACE/filemanager.log" 2>&1 &
+  log "File manager log: $WORKSPACE/filemanager.log"
+}
+
+start_filemanager
+
 log "Starting ARP GUI on ${AI_REMASTER_GUI_HOST}:${AI_REMASTER_GUI_PORT} (ComfyUI autostarts on :8188)"
 cd "$ARP_ROOT"
 exec python -m ai_remaster_gui "$@"
