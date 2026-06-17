@@ -1,0 +1,27 @@
+# Keep the build context small. The entrypoint recreates runtime dirs on the volume.
+.git
+.github
+
+# Runtime media & generated outputs (recreated as symlinks to /workspace)
+input/*
+!input/.gitkeep
+intermediate/**
+output/**
+manifests/**/*.csv
+
+# Local caches / venvs / configs from host runs
+.venv/
+.venv-realbasicvsr/
+venv/
+.cache/
+.ai_remaster_config.json
+.ai_remaster_gui.json
+**/__pycache__/
+*.pyc
+
+# Large README artwork (not needed at runtime)
+assets/screenshots/
+
+# Local model/tool trees from host installs
+tools/
+models/

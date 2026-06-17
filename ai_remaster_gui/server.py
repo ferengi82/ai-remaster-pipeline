@@ -2544,7 +2544,7 @@ def main() -> int:
     install_shutdown_handlers()
     if os.environ.get("AI_REMASTER_NO_COMFY_AUTOSTART") != "1":
             start_comfy_if_needed()
-    host = "127.0.0.1"
+    host = os.environ.get("AI_REMASTER_GUI_HOST", "127.0.0.1")
     requested_port = int(os.environ.get("AI_REMASTER_GUI_PORT", "8765"))
     server = create_server(host, requested_port)
     url = f"http://{host}:{server.server_port}/"
