@@ -497,6 +497,17 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 APP.log.append(f"Browse failed: {exc}")
                 self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/list-dir":
+            try:
+                self.send_json(list_directory(str(data.get("kind", "file")), str(data.get("current", ""))))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)})
+        elif parsed.path == "/api/pick-global-source":
+            try:
+                self.send_json(pick_global_source(str(data.get("path", ""))))
+            except Exception as exc:
+                APP.log.append(f"Pick source failed: {exc}")
+                self.send_json({"ok": False, "error": str(exc)})
         elif parsed.path == "/api/overview-clear":
             APP.clear_overview()
             self.send_json({"ok": True, "state": APP.state("global")})

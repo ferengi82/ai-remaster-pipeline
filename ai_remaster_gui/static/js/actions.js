@@ -1264,18 +1264,29 @@ async function markSourceSection(edge) {
   await saveGlobalSection();
 }
 
-async function browseGlobalSource() {
-  const el = document.getElementById('globalSource');
-  const result = await postJson('/api/browse-global-source', { current: el.value });
-  if (!result.ok) return alert(result.error || 'Browse failed');
-
+async function applyGlobalSourceResult(result) {
   if (!result.path) return await refresh(true);
-
   selected = {};
   state = result.state;
   pruneSelected();
   draw();
   lastRenderSignature = renderSignature();
+}
+
+async function browseGlobalSource() {
+  const el = document.getElementById('globalSource');
+  const result = await postJson('/api/browse-global-source', { current: el.value });
+  if (!result.ok) {
+    if (/native file picker/i.test(result.error || '')) {
+      return openFilePicker('file', el.value, async (p) => {
+        const r = await postJson('/api/pick-global-source', { path: p });
+        if (!r.ok) return alert(r.error || 'Could not set source');
+        await applyGlobalSourceResult(r);
+      });
+    }
+    return alert(result.error || 'Browse failed');
+  }
+  await applyGlobalSourceResult(result);
 }
 
 async function clearOverview() {
@@ -1330,12 +1341,85 @@ async function loadProject() {
 async function browseField(stageKey, fieldKey, kind) {
   const el = document.querySelector(`[data-field="${fieldKey}"]`);
   const result = await postJson('/api/browse', { kind, current: el.value });
-  if (!result.ok) return alert(result.error || 'Browse failed');
-
+  if (!result.ok) {
+    if (/native file picker/i.test(result.error || '')) {
+      return openFilePicker(kind, el.value, async (p) => {
+        el.value = p;
+        await saveStage(stageKey);
+      });
+    }
+    return alert(result.error || 'Browse failed');
+  }
   if (result.path) {
     el.value = result.path;
     await saveStage(stageKey);
   }
+}
+
+// In-browser file picker, used on headless servers (RunPod) where no native OS
+// file dialog exists. Lists files server-side, starting in the input folder.
+function closeFilePicker() {
+  const modal = document.getElementById('filePickerModal');
+  if (modal) modal.classList.add('hidden');
+}
+
+async function loadFilePickerDir(kind, dir) {
+  const result = await postJson('/api/list-dir', { kind, current: dir || '' });
+  if (!result.ok) return alert(result.error || 'Could not list directory');
+  const modal = document.getElementById('filePickerModal');
+  if (modal) { modal.dataset.kind = kind; modal.dataset.dir = result.dir; }
+  const pathEl = document.getElementById('filePickerPath');
+  if (pathEl) pathEl.textContent = result.dir;
+  const list = document.getElementById('filePickerList');
+  if (!list) return;
+  list.innerHTML = '';
+  if (result.parent) {
+    const up = document.createElement('div');
+    up.className = 'file-picker-row file-picker-dir';
+    up.textContent = '\u{1F4C1} ..';
+    up.onclick = () => loadFilePickerDir(kind, result.parent);
+    list.appendChild(up);
+  }
+  for (const entry of (result.entries || [])) {
+    const row = document.createElement('div');
+    row.className = 'file-picker-row ' + (entry.is_dir ? 'file-picker-dir' : 'file-picker-file');
+    row.textContent = (entry.is_dir ? '\u{1F4C1} ' : '\u{1F3AC} ') + entry.name;
+    if (entry.is_dir) {
+      row.onclick = () => loadFilePickerDir(kind, entry.path);
+    } else {
+      row.onclick = () => { const cb = window.__filePickerOnPick; closeFilePicker(); if (cb) cb(entry.path); };
+    }
+    list.appendChild(row);
+  }
+  if (!(result.entries || []).length && !result.parent) {
+    const empty = document.createElement('div');
+    empty.className = 'shot-empty';
+    empty.textContent = 'No matching files here. Upload videos via the file manager (port 8888) into the input folder.';
+    list.appendChild(empty);
+  }
+}
+
+function openFilePicker(kind, current, onPick) {
+  window.__filePickerOnPick = onPick;
+  let modal = document.getElementById('filePickerModal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'filePickerModal';
+    modal.className = 'image-modal hidden';
+    modal.innerHTML = `
+      <div class="image-modal-backdrop" onclick="closeFilePicker()"></div>
+      <div class="prompt-modal-panel file-picker-panel">
+        <div class="image-modal-heading">
+          <strong>Select a file on the server</strong>
+          <button type="button" onclick="closeFilePicker()">Close</button>
+        </div>
+        <div id="filePickerPath" class="file-picker-current"></div>
+        <div id="filePickerList" class="file-picker-list"></div>
+      </div>`;
+    document.body.appendChild(modal);
+  }
+  modal.classList.remove('hidden');
+  loadFilePickerDir(kind, current || '');
 }
 
 async function showCommand(key) {

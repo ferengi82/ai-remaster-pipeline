@@ -194,6 +194,8 @@ from .media import (
     media_clip_path,
     bind_context as bind_media_context,
 )
+from .config import DATA_ROOT
+from .config import CACHE_ROOT
 
 MODEL_SIZE_MULTIPLE = 32
 STABLE_AUDIO_LICENSE_URL = "https://huggingface.co/stabilityai/stable-audio-open-1.0"
@@ -214,7 +216,7 @@ def stable_audio_checkpoint_path(checkpoint: str) -> Path:
 
 def stable_audio_handoff_marker_path(checkpoint: str) -> Path:
     digest = hashlib.sha1(checkpoint.encode("utf-8", errors="ignore")).hexdigest()[:12]
-    return ROOT / ".cache" / "handoffs" / f"stable_audio_{digest}.json"
+    return CACHE_ROOT / "handoffs" / f"stable_audio_{digest}.json"
 
 
 def stable_audio_browser_handoff(checkpoint: str) -> tuple[bool, str]:
@@ -422,7 +424,7 @@ class PipelineApp:
         if not source_text:
             return []
         source = resolve(source_text)
-        work_dir = ROOT / ".cache" / "audio" / safe_stem(source.name)
+        work_dir = CACHE_ROOT / "audio" / safe_stem(source.name)
         stems = (
             ("music", "Music stem", "music_stem.wav"),
             ("sfx", "Sound effects stem", "sfx_stem.wav"),
@@ -1801,7 +1803,7 @@ def manifest_for_outpainted(outpainted_text: str) -> str:
         return ""
     outpainted = resolve(outpainted_text)
     ident = aid.shots_identity(outpainted.stem)
-    return rel(ROOT / "manifests" / "references" / aid.artifact_name(aid.source_word(outpainted.name), "shots", ident, "csv"))
+    return rel(DATA_ROOT / "manifests" / "references" / aid.artifact_name(aid.source_word(outpainted.name), "shots", ident, "csv"))
 
 
 def outpaint_output_for(source_text: str, aspect: str, target_height_text: str = "720") -> str:
@@ -1813,7 +1815,7 @@ def outpaint_output_for(source_text: str, aspect: str, target_height_text: str =
     width, height = outpaint_work_size_for_source(source_text, aspect, target_height_text)
     values = APP.settings.get("outpaint", {}) if "APP" in globals() else {}
     crop, black = _outpaint_crop_black(values)
-    return rel(ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "outpaint", "mp4"))
+    return rel(DATA_ROOT / "intermediate" / "outpainted" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "outpaint", "mp4"))
 
 
 def upscale_target_size(values: dict[str, str]) -> tuple[int, int]:
@@ -1834,7 +1836,7 @@ def upscale_output_for(source_text: str, values: dict[str, str]) -> str:
     source = resolve(source_text)
     width, height = upscale_target_size(values)
     ident = aid.upscale_identity(source.stem, width, height, "flashvsr")
-    return rel(ROOT / "output" / "upscaled" / aid.artifact_name(aid.source_word(source.name), "upscale", ident, "mp4"))
+    return rel(DATA_ROOT / "output" / "upscaled" / aid.artifact_name(aid.source_word(source.name), "upscale", ident, "mp4"))
 
 
 def soundtrack_output_for(source_text: str, values: dict[str, str]) -> str:
@@ -1844,7 +1846,7 @@ def soundtrack_output_for(source_text: str, values: dict[str, str]) -> str:
     music = values.get("create_music", "true") == "true"
     sfx = values.get("create_sfx", "true") == "true"
     ident = aid.soundtrack_identity(source.stem, music, sfx)
-    return rel(ROOT / "output" / "with_soundtrack" / aid.artifact_name(aid.source_word(source.name), "audio", ident, "mp4"))
+    return rel(DATA_ROOT / "output" / "with_soundtrack" / aid.artifact_name(aid.source_word(source.name), "audio", ident, "mp4"))
 
 
 def upscale_preview_output_for(source_text: str, values: dict[str, str]) -> str:
@@ -1854,7 +1856,7 @@ def upscale_preview_output_for(source_text: str, values: dict[str, str]) -> str:
     width, height = upscale_target_size(values)
     seconds = str(values.get("preview_seconds", "6") or "6")
     ident = aid.upscale_preview_identity(source.stem, width, height, "flashvsr", seconds)
-    return rel(ROOT / "output" / "upscaled" / "previews" / aid.artifact_name(aid.source_word(source.name), "upscalepreview", ident, "mp4"))
+    return rel(DATA_ROOT / "output" / "upscaled" / "previews" / aid.artifact_name(aid.source_word(source.name), "upscalepreview", ident, "mp4"))
 
 
 def source_duration_text(source: Path) -> str:
@@ -1892,7 +1894,7 @@ def outpaint_chunk_dir_for(source_text: str, values: dict[str, str]) -> Path:
     aspect = values.get("target_aspect", "16:9")
     width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
     crop, black = _outpaint_crop_black(values)
-    return ROOT / ".cache" / "outpaint_chunks" / aid.outpaint_basename(source.name, aspect, width, height, crop, black, "chunks")
+    return CACHE_ROOT / "outpaint_chunks" / aid.outpaint_basename(source.name, aspect, width, height, crop, black, "chunks")
 
 
 def outpaint_chunk_manifest_for(source_text: str, values: dict[str, str]) -> str:
@@ -1902,7 +1904,7 @@ def outpaint_chunk_manifest_for(source_text: str, values: dict[str, str]) -> str
     aspect = values.get("target_aspect", "16:9")
     width, height = outpaint_work_size_for_source(source_text, aspect, values.get("target_height", "720"))
     crop, black = _outpaint_crop_black(values)
-    return rel(ROOT / "manifests" / "outpaint_chunks" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "chunks", "csv"))
+    return rel(DATA_ROOT / "manifests" / "outpaint_chunks" / aid.outpaint_name(source.name, aspect, width, height, crop, black, "chunks", "csv"))
 
 
 def outpaint_chunk_offset_slug(row: dict[str, str]) -> str:
@@ -1920,7 +1922,7 @@ def outpaint_prepared_for(source_text: str, values: dict[str, str]) -> Path:
     height_text = values.get("target_height", "720")
     work_w, work_h = outpaint_work_size_for_source(source_text, aspect, height_text)
     crop, black = _outpaint_crop_black(values)
-    return ROOT / "intermediate" / "outpaint_prepared" / aid.outpaint_name(source.name, aspect, work_w, work_h, crop, black, "prepared", "mp4")
+    return DATA_ROOT / "intermediate" / "outpaint_prepared" / aid.outpaint_name(source.name, aspect, work_w, work_h, crop, black, "prepared", "mp4")
 
 
 def ensure_outpaint_prepared_canvas(source_text: str, values: dict[str, str]) -> Path:
@@ -2213,10 +2215,10 @@ def remove_cached_file(path: Path) -> bool:
 
 
 def clear_cached_guide_frames(manifest: Path, index: int) -> int:
-    guide_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem
+    guide_dir = DATA_ROOT / "intermediate" / "outpaint_guides" / manifest.stem
     if not guide_dir.exists():
         # Also check legacy path name used before the anchorâ†’guide rename.
-        guide_dir = ROOT / "intermediate" / "outpaint_anchors" / manifest.stem
+        guide_dir = DATA_ROOT / "intermediate" / "outpaint_anchors" / manifest.stem
         if not guide_dir.exists():
             return 0
     removed = 0
@@ -2247,7 +2249,7 @@ def install_outpaint_guide(index: int) -> dict[str, str]:
     if not source.exists() or not source.is_file():
         raise FileNotFoundError(source)
 
-    target_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem
+    target_dir = DATA_ROOT / "intermediate" / "outpaint_guides" / manifest.stem
     target = target_dir / f"chunk_{index:04d}_guide{source.suffix.lower()}"
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)
@@ -2302,7 +2304,7 @@ def install_outpaint_end_guide(index: int) -> dict[str, str]:
     if not source.exists() or not source.is_file():
         raise FileNotFoundError(source)
 
-    target_dir = ROOT / "intermediate" / "outpaint_guides" / manifest.stem
+    target_dir = DATA_ROOT / "intermediate" / "outpaint_guides" / manifest.stem
     target = target_dir / f"chunk_{index:04d}_guide_end{source.suffix.lower()}"
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)
@@ -2503,6 +2505,78 @@ def clear_outpaint_end_guide(index: int) -> dict[str, str]:
 
 
 
+
+
+def _browse_allowed_roots() -> list[Path]:
+    """Directories the web file picker is allowed to browse (the volume + data/code roots)."""
+    roots: list[Path] = []
+    for cand in (DATA_ROOT, os.environ.get("ARP_WORKSPACE"), ROOT):
+        if not cand:
+            continue
+        try:
+            path = Path(cand).resolve()
+        except OSError:
+            continue
+        if path.exists() and path not in roots:
+            roots.append(path)
+    return roots
+
+
+def _within_roots(path: Path, roots: list[Path]) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    for root in roots:
+        if resolved == root:
+            return True
+        try:
+            resolved.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def list_directory(kind: str, current: str = "") -> dict:
+    """Server-side directory listing for the in-browser file picker (headless servers have no
+    native dialog). Defaults to the input folder and is confined to the allowed roots."""
+    roots = _browse_allowed_roots()
+    default_dir = DATA_ROOT / "input"
+    default_dir.mkdir(parents=True, exist_ok=True)
+
+    target = default_dir
+    if current:
+        candidate = resolve(current)
+        candidate = candidate if candidate.is_dir() else candidate.parent
+        if candidate.exists() and _within_roots(candidate, roots):
+            target = candidate.resolve()
+    if not _within_roots(target, roots):
+        target = default_dir
+
+    exts = set(IMAGE_EXTS) if kind == "image" else (set(VIDEO_EXTS) | set(IMAGE_EXTS) | {".json", ".csv"})
+    dirs: list[dict] = []
+    files: list[dict] = []
+    try:
+        for entry in sorted(target.iterdir(), key=lambda item: item.name.lower()):
+            if entry.name.startswith("."):
+                continue
+            if entry.is_dir():
+                dirs.append({"name": entry.name, "path": str(entry), "is_dir": True})
+            elif entry.is_file() and entry.suffix.lower() in exts:
+                files.append({"name": entry.name, "path": rel(entry), "is_dir": False})
+    except (PermissionError, OSError):
+        pass
+
+    parent = str(target.parent) if (target.parent != target and _within_roots(target.parent, roots)) else None
+    return {"ok": True, "dir": str(target), "parent": parent, "entries": dirs + files}
+
+
+def pick_global_source(path: str) -> dict:
+    """Set the global source from a web-picker selection (mirrors the native browse branch)."""
+    if path:
+        APP.update_settings("global", {"source": path})
+    return {"ok": True, "path": path, "state": APP.state("global")}
 
 
 from .http_handler import Handler, bind_context as bind_http_handler_context

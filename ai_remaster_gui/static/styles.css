@@ -45,3 +45,11 @@ table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--li
 .checkbox-described-text{display:flex;flex-direction:column;gap:3px}
 .checkbox-described-text strong{font-size:13px;font-weight:600;color:var(--text)}
 .checkbox-described-text small{color:var(--muted);font-size:11.5px;line-height:1.45}
+
+/* In-browser file picker (headless servers) */
+.file-picker-panel { width: min(640px, 92vw); max-height: 80vh; display: flex; flex-direction: column; }
+.file-picker-current { font-family: monospace; font-size: 0.8rem; opacity: 0.8; margin: 4px 0 8px; word-break: break-all; }
+.file-picker-list { overflow-y: auto; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; }
+.file-picker-row { padding: 7px 10px; cursor: pointer; border-bottom: 1px solid rgba(255,255,255,0.06); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.file-picker-row:hover { background: rgba(255,255,255,0.08); }
+.file-picker-dir { font-weight: 600; }

@@ -67,6 +67,9 @@ at `/workspace/.filebrowser/` and persist with the volume; its runtime log is
 
 - Open the **port-8765 proxy URL** from the pod → the ARP web GUI.
 - The GUI auto-starts ComfyUI on `:8188` (also reachable via its proxy URL).
+- Click **Browse** next to a path field: since the pod is headless (no native OS
+  dialog), ARP opens an **in-browser file picker** rooted at the input folder
+  (`/workspace/arp-data/input`) so you can pick a file already on the server.
 - Pick a source video and run a stage; models download to
   `/workspace/models/...` on first use. Outputs land under
   `/workspace/arp-data/{intermediate,output,manifests}`.
