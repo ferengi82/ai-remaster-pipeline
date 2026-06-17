@@ -30,12 +30,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.13 python3.13-venv python3.13-dev \
  && rm -rf /var/lib/apt/lists/*
 
-# --- miniserve: simple web file manager for /workspace (single static binary) -
-ARG MINISERVE_VERSION=0.29.0
-RUN curl -fsSL -o /usr/local/bin/miniserve \
-        "https://github.com/svenstaro/miniserve/releases/download/v${MINISERVE_VERSION}/miniserve-${MINISERVE_VERSION}-x86_64-unknown-linux-musl" \
- && chmod +x /usr/local/bin/miniserve \
- && miniserve --version
+# --- filebrowser: web file manager for /workspace (chunked uploads, delete,
+#     rename/move, mkdir). Single Go binary. ----------------------------------
+ARG FILEBROWSER_VERSION=2.63.15
+RUN curl -fsSL "https://github.com/filebrowser/filebrowser/releases/download/v${FILEBROWSER_VERSION}/linux-amd64-filebrowser.tar.gz" \
+        | tar -xz -C /usr/local/bin filebrowser \
+ && chmod +x /usr/local/bin/filebrowser \
+ && filebrowser version
 
 # --- Python venv ------------------------------------------------------------
 RUN python3.13 -m venv /opt/venv \

@@ -132,26 +132,60 @@ else
   write_config
 fi
 
+# filebrowser-based web file manager. Supports chunked uploads (no proxy
+# timeouts on multi-GB videos), delete, rename/move and mkdir. All DB mutations
+# happen here BEFORE the server starts, because filebrowser's bolt DB is locked
+# while the server runs.
 start_filemanager() {
   if [ "${ARP_ENABLE_FILES:-1}" = "0" ]; then
     log "File manager disabled (ARP_ENABLE_FILES=0)."
     return
   fi
-  if ! command -v miniserve >/dev/null 2>&1; then
-    log "miniserve not found; skipping file manager."
+  if ! command -v filebrowser >/dev/null 2>&1; then
+    log "filebrowser not found; skipping file manager."
     return
   fi
+
   local port="${ARP_FILES_PORT:-8888}"
-  local auth_args=()
-  if [ -n "${ARP_FILES_AUTH:-}" ]; then
-    auth_args=(--auth "$ARP_FILES_AUTH")   # format USER:PASSWORD
-    log "Starting file manager on 0.0.0.0:${port} (auth enabled) -> $WORKSPACE"
-  else
-    log "Starting file manager on 0.0.0.0:${port} (NO AUTH) -> $WORKSPACE"
+  local user="${ARP_FILES_USER:-admin}"
+  local fb_dir="$WORKSPACE/.filebrowser"
+  local fb_db="$fb_dir/filebrowser.db"
+  local fb_pwfile="$fb_dir/admin_password"
+  mkdir -p "$fb_dir"
+
+  # filebrowser requires passwords >= 12 chars. Use ARP_FILES_PASSWORD if valid,
+  # otherwise reuse a previously generated one or mint a new one (logged once).
+  local pass="${ARP_FILES_PASSWORD:-}"
+  if [ -n "$pass" ] && [ "${#pass}" -lt 12 ]; then
+    log "ARP_FILES_PASSWORD is shorter than 12 chars (filebrowser minimum); generating one instead."
+    pass=""
   fi
-  # -u upload, -U mkdir, -o overwrite, -H show hidden files.
-  miniserve "$WORKSPACE" -i 0.0.0.0 -p "$port" -u -U -o -H "${auth_args[@]}" \
-    >> "$WORKSPACE/filemanager.log" 2>&1 &
+  if [ -z "$pass" ]; then
+    if [ -s "$fb_pwfile" ]; then
+      pass="$(cat "$fb_pwfile")"
+    else
+      pass="$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)"
+      printf '%s' "$pass" > "$fb_pwfile"
+      chmod 600 "$fb_pwfile"
+      log "Generated file-manager login (saved to $fb_pwfile):"
+      log "    user: ${user}   password: ${pass}"
+    fi
+  fi
+
+  if [ ! -f "$fb_db" ]; then
+    log "Initializing filebrowser database at $fb_db"
+    filebrowser config init -d "$fb_db" >/dev/null
+  fi
+  # (Re)apply runtime config every boot so env changes take effect.
+  filebrowser config set -d "$fb_db" --auth.method=json \
+    -a 0.0.0.0 -p "$port" -r "$WORKSPACE" >/dev/null
+  # Ensure the admin user exists with the current password (server not running yet).
+  if ! filebrowser users add "$user" "$pass" --perm.admin -d "$fb_db" >/dev/null 2>&1; then
+    filebrowser users update "$user" --password "$pass" --perm.admin -d "$fb_db" >/dev/null 2>&1 || true
+  fi
+
+  log "Starting file manager (filebrowser) on 0.0.0.0:${port} -> $WORKSPACE (login user: ${user})"
+  filebrowser -d "$fb_db" >> "$WORKSPACE/filemanager.log" 2>&1 &
   log "File manager log: $WORKSPACE/filemanager.log"
 }
 

@@ -43,16 +43,24 @@ MMAudio/Stable Audio are tens of GB — **150 GB+ recommended**).
 | `ARP_WORKSPACE` | `/workspace` | Volume mount path (match the RunPod mount). |
 | `ARP_ENABLE_FILES` | `1` | Set `0` to disable the web file manager. |
 | `ARP_FILES_PORT` | `8888` | File manager port. |
-| `ARP_FILES_AUTH` | – | Set `user:password` to require login for the file manager (recommended, since it can read/write all of `/workspace`). |
+| `ARP_FILES_USER` | `admin` | File manager login user. |
+| `ARP_FILES_PASSWORD` | _(generated)_ | File manager password. **Min. 12 chars.** If unset, a random one is generated on first boot, logged once, and saved to `/workspace/.filebrowser/admin_password`. |
 
 ## File manager (port 8888)
 
-A lightweight web file manager ([miniserve](https://github.com/svenstaro/miniserve))
+A full web file manager ([filebrowser](https://github.com/filebrowser/filebrowser))
 serves the whole volume at the **port-8888 proxy URL**. Use it to upload source
-videos (e.g. into `/workspace/arp-data/input`), browse intermediate/output, create
-folders, and download results — no SSH/SCP needed. Uploads, mkdir and overwrite are
-enabled. **It has no authentication by default**; set `ARP_FILES_AUTH=user:password`
-to protect it (strongly recommended on a public RunPod URL). Its log is written to
+videos (e.g. into `/workspace/arp-data/input`), browse intermediate/output, and
+**create folders, rename, move and delete** files — no SSH/SCP needed.
+
+Uploads are **chunked**, so large multi-GB videos no longer hit the RunPod proxy
+timeout that a single POST would.
+
+**Login is required** (filebrowser `json` auth). Set `ARP_FILES_USER` /
+`ARP_FILES_PASSWORD` (password ≥ 12 chars), or let it generate a password on first
+boot — printed to the container log and stored at
+`/workspace/.filebrowser/admin_password`. The filebrowser database and settings live
+at `/workspace/.filebrowser/` and persist with the volume; its runtime log is
 `/workspace/filemanager.log`.
 
 ## 4. Use it
