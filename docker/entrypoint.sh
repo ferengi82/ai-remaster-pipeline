@@ -24,6 +24,8 @@ export HF_HOME="${HF_HOME:-$ARP_CACHE_DIR/huggingface}"
 export AI_REMASTER_GUI_HOST="${AI_REMASTER_GUI_HOST:-0.0.0.0}"
 export AI_REMASTER_GUI_PORT="${AI_REMASTER_GUI_PORT:-8765}"
 export AI_REMASTER_NO_BROWSER=1
+# The entrypoint owns ComfyUI (one instance per GPU), so the GUI must not start its own.
+export AI_REMASTER_NO_COMFY_AUTOSTART=1
 # HF_TOKEN (if set in the pod env) is inherited automatically and used for gated
 # repos such as stabilityai/stable-audio-open-1.0.
 
@@ -116,6 +118,53 @@ PY
   ) || log "Prefetch failed (continuing; models will retry on demand)."
 }
 
+# Detect the GPU count and launch one ComfyUI instance per GPU (each pinned to its own GPU).
+# Instance 0 (port 8188) is the primary used by the GUI and all non-upscale stages; the upscale
+# stage spreads chunks across every instance via the exported ARP_COMFY_URLS. Override the count
+# with ARP_COMFY_GPUS (e.g. 1 to force single-GPU).
+start_comfyui_instances() {
+  local n="${ARP_COMFY_GPUS:-auto}"
+  if [ "$n" = "auto" ] || [ "$n" = "0" ] || [ -z "$n" ]; then
+    n=""
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      n="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)"
+    fi
+    if [ -z "$n" ] || [ "$n" = "0" ]; then
+      n="$(python -c 'import torch; print(torch.cuda.device_count())' 2>/dev/null || echo 0)"
+    fi
+  fi
+  case "$n" in ''|*[!0-9]*) n=1 ;; esac
+  [ "$n" -ge 1 ] || n=1
+  log "Detected/using $n GPU(s); starting $n ComfyUI instance(s)."
+
+  local urls="" i port bind
+  for i in $(seq 0 $((n - 1))); do
+    port=$((8188 + i))
+    [ "$i" -eq 0 ] && bind="0.0.0.0" || bind="127.0.0.1"
+    log "  ComfyUI #$i -> GPU $i, http://${bind}:${port}"
+    ( cd "$COMFY_DIR" && CUDA_VISIBLE_DEVICES="$i" \
+        python "$COMFY_DIR/main.py" --listen "$bind" --port "$port" \
+        >> "$WORKSPACE/comfyui-$i.log" 2>&1 ) &
+    urls="${urls:+$urls,}http://127.0.0.1:${port}"
+  done
+  export ARP_COMFY_URLS="$urls"
+  log "ARP_COMFY_URLS=$ARP_COMFY_URLS"
+
+  # Best-effort wait for each instance's HTTP server (model load stays lazy / per-prompt).
+  local timeout="${ARP_COMFY_START_TIMEOUT:-300}" waited
+  for i in $(seq 0 $((n - 1))); do
+    port=$((8188 + i)); waited=0
+    until curl -fsS -o /dev/null "http://127.0.0.1:${port}/" 2>/dev/null; do
+      sleep 2; waited=$((waited + 2))
+      if [ "$waited" -ge "$timeout" ]; then
+        log "  ComfyUI on port $port not ready after ${waited}s (continuing; see comfyui-$i.log)."
+        break
+      fi
+    done
+    [ "$waited" -lt "$timeout" ] && log "  ComfyUI on port $port ready."
+  done
+}
+
 # --- main -------------------------------------------------------------------
 if [ ! -e "$SENTINEL" ]; then
   init_volume
@@ -187,8 +236,9 @@ start_filemanager() {
   log "File manager log: $WORKSPACE/filemanager.log"
 }
 
+start_comfyui_instances
 start_filemanager
 
-log "Starting ARP GUI on ${AI_REMASTER_GUI_HOST}:${AI_REMASTER_GUI_PORT} (ComfyUI autostarts on :8188)"
+log "Starting ARP GUI on ${AI_REMASTER_GUI_HOST}:${AI_REMASTER_GUI_PORT} (ComfyUI instances managed by entrypoint)"
 cd "$ARP_ROOT"
 exec python -m ai_remaster_gui "$@"

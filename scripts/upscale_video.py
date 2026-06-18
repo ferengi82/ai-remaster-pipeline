@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import queue
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-height", type=int, default=2160)
     parser.add_argument("--comfy-dir", default=config.get("comfy_dir", str(ROOT / "tools" / "comfyui")))
     parser.add_argument("--comfy-url", default=config.get("comfy_url", "http://127.0.0.1:8188"))
+    parser.add_argument("--comfy-urls", default=os.environ.get("ARP_COMFY_URLS", ""), help="Comma-separated ComfyUI URLs for multi-GPU parallel chunk upscaling. Defaults to the ARP_COMFY_URLS env var, else --comfy-url.")
     parser.add_argument("--comfy-output-root", default="")
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--flashvsr-model", choices=["FlashVSR", "FlashVSR-v1.1"], default="FlashVSR-v1.1")
@@ -186,27 +190,28 @@ def flashvsr_prompt(video_name: str, fps: float, args: argparse.Namespace, prefi
     }
 
 
-def flashvsr_run(args: argparse.Namespace, source: Path, partial: Path, output_width: int, output_height: int) -> Path:
+def flashvsr_run(args: argparse.Namespace, source: Path, partial: Path, output_width: int, output_height: int, comfy_url: str | None = None) -> Path:
+    comfy_url = comfy_url or args.comfy_url
     comfy_dir = resolve_path(args.comfy_dir)
     comfy_output_root = resolve_path(args.comfy_output_root) if args.comfy_output_root else comfy_dir / "output"
     if not (comfy_dir / "main.py").exists():
         raise FileNotFoundError(f"ComfyUI main.py not found: {comfy_dir / 'main.py'}")
-    wait_for_comfy(args.comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
+    wait_for_comfy(comfy_url, timeout_seconds=180, poll_seconds=args.poll_seconds)
     required_nodes = {
         "VHS_LoadVideo": "ComfyUI-VideoHelperSuite",
         "VHS_VideoCombine": "ComfyUI-VideoHelperSuite",
         "FlashVSRInitPipe": "ComfyUI-FlashVSR_Ultra_Fast",
         "FlashVSRNodeAdv": "ComfyUI-FlashVSR_Ultra_Fast",
     }
-    ensure_node_types(args.comfy_url, required_nodes, "FlashVSR upscaling")
-    info = object_info(args.comfy_url)
+    ensure_node_types(comfy_url, required_nodes, "FlashVSR upscaling")
+    info = object_info(comfy_url)
     video_name = copy_to_comfy_input(source, comfy_dir, "arp_upscale")
     fps = args.fps or float(video_info(source)["fps"])
     prefix = f"arp_upscale/{safe_stem(source.name)}_flashvsr_{output_width}x{output_height}"
     prompt = flashvsr_prompt(video_name, fps, args, prefix, info)
-    prompt_id = queue_prompt(args.comfy_url, prompt)
-    print(f"Queued ComfyUI prompt: {prompt_id}", flush=True)
-    history = wait_for_prompt(args.comfy_url, prompt_id, args.poll_seconds)
+    prompt_id = queue_prompt(comfy_url, prompt)
+    print(f"Queued ComfyUI prompt {prompt_id} on {comfy_url}", flush=True)
+    history = wait_for_prompt(comfy_url, prompt_id, args.poll_seconds)
     produced = newest_comfy_output(extract_output_files(history, comfy_output_root), {".mp4", ".mov", ".mkv", ".webm"}, "FlashVSR video")
     partial.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(produced, partial)
@@ -364,26 +369,50 @@ def chunked_flashvsr_run(args: argparse.Namespace, source: Path, output: Path, o
 
     chunk_dir = CACHE_ROOT / "upscale_chunks" / f"{safe_stem(source.name)}_flashvsr_{output_width}x{output_height}_{int(args.chunk_seconds * 1000)}ms_ov{max(0, args.overlap_frames)}"
     chunk_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Splitting upscaling into {len(ranges)} chunk(s): {args.chunk_seconds:g}s chunks, {max(0, args.overlap_frames)} overlap frame(s)", flush=True)
-    normalized_chunks: list[Path] = []
+
+    # One ComfyUI URL per GPU (multi-GPU pods). Chunks are independent, so they are dispatched
+    # concurrently across the instances; a URL queue guarantees at most one in-flight job per
+    # instance. A single URL behaves exactly like the old sequential loop.
+    urls = [u.strip() for u in (getattr(args, "comfy_urls", "") or "").split(",") if u.strip()] or [args.comfy_url]
+    workers = max(1, len(urls))
+    print(f"Splitting upscaling into {len(ranges)} chunk(s): {args.chunk_seconds:g}s chunks, {max(0, args.overlap_frames)} overlap frame(s); {workers} GPU worker(s)", flush=True)
     digits = max(4, int(math.log10(len(ranges))) + 1)
-    for index, (start_frame, end_frame, trim_start) in enumerate(ranges):
+
+    url_pool: "queue.Queue[str]" = queue.Queue()
+    for url in urls:
+        url_pool.put(url)
+
+    def process_chunk(index: int, start_frame: int, end_frame: int, trim_start: int) -> Path:
         chunk_input = chunk_dir / f"input_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mp4"
         chunk_raw = chunk_dir / f"raw_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mp4"
         chunk_final = chunk_dir / f"final_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mp4"
-        print(f"Upscale chunk {index + 1}/{len(ranges)}: frames {start_frame}-{end_frame}, trim {trim_start}", flush=True)
         split_video_chunk(ffmpeg, source, chunk_input, start_frame, end_frame, fps, args.force, source_fingerprint)
         chunk_sig = signature(args, chunk_input, output_width, output_height)
         if not args.force and resumable_output(chunk_final, chunk_sig, width=output_width, height=output_height):
-            print(f"Reuse upscaled chunk: {chunk_final}", flush=True)
-            normalized_chunks.append(chunk_final)
-            continue
-        flashvsr_run(args, chunk_input, chunk_raw, output_width, output_height)
+            print(f"Reuse upscaled chunk {index + 1}/{len(ranges)}: {chunk_final}", flush=True)
+            return chunk_final
+        url = url_pool.get()
+        try:
+            print(f"Upscale chunk {index + 1}/{len(ranges)} on {url}: frames {start_frame}-{end_frame}, trim {trim_start}", flush=True)
+            flashvsr_run(args, chunk_input, chunk_raw, output_width, output_height, comfy_url=url)
+        finally:
+            url_pool.put(url)
         normalize_chunk(ffmpeg, chunk_raw, chunk_final, output_width, output_height, trim_start, True)
         write_signature(chunk_final, chunk_sig)
-        print(f"Wrote upscaled chunk: {chunk_final}", flush=True)
         chunk_raw.unlink(missing_ok=True)
-        normalized_chunks.append(chunk_final)
+        print(f"Wrote upscaled chunk {index + 1}/{len(ranges)}: {chunk_final}", flush=True)
+        return chunk_final
+
+    results: dict[int, Path] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(process_chunk, index, start_frame, end_frame, trim_start): index
+            for index, (start_frame, end_frame, trim_start) in enumerate(ranges)
+        }
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+
+    normalized_chunks = [results[index] for index in range(len(ranges))]
     if output.exists():
         output.unlink()
     stitch_chunks(ffmpeg, normalized_chunks, source, output)

@@ -41,6 +41,7 @@ MMAudio/Stable Audio are tens of GB — **150 GB+ recommended**).
 | `ARP_PREFETCH_MODELS` | `0` | Set `1` to eagerly download the LTX + Qwen model set during first boot instead of lazily per stage. |
 | `AI_REMASTER_GUI_PORT` | `8765` | ARP GUI port. |
 | `ARP_WORKSPACE` | `/workspace` | Volume mount path (match the RunPod mount). |
+| `ARP_COMFY_GPUS` | _(auto)_ | Number of ComfyUI instances to start. Auto-detected from the GPU count (`nvidia-smi`); set e.g. `1` to force single-GPU or cap it. |
 | `ARP_ENABLE_FILES` | `1` | Set `0` to disable the web file manager. |
 | `ARP_FILES_PORT` | `8888` | File manager port. |
 | `ARP_FILES_USER` | `admin` | File manager login user. |
@@ -86,6 +87,18 @@ at `/workspace/.filebrowser/` and persist with the volume; its runtime log is
 | `/workspace/models` | **volume** | Downloaded model weights / LoRAs |
 | `/workspace/arp-data` | **volume** | input / intermediate / output / manifests |
 | `/workspace/hf-cache`, `/workspace/arp-cache` | **volume** | HF + ARP caches |
+
+## Multi-GPU upscaling
+
+On a multi-GPU pod the entrypoint **auto-detects the GPU count** and starts **one ComfyUI
+instance per GPU** (ports `8188`, `8189`, … — each pinned via `CUDA_VISIBLE_DEVICES`; only
+`8188` is exposed, the rest are localhost-internal). The **Upscaling** stage (FlashVSR) splits
+the video into chunks and processes them **in parallel across all instances**, giving roughly
+linear speedup with the number of GPUs. All other stages (outpaint, references, colorize,
+audio) and the ComfyUI UI use instance 0 (GPU 0).
+
+Override with `ARP_COMFY_GPUS` (e.g. `1` to force single-GPU). Single-GPU behaviour is
+unchanged. Each instance needs enough VRAM to hold FlashVSR on its own GPU.
 
 ## Security note
 
