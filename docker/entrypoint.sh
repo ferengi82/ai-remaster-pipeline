@@ -21,6 +21,10 @@ SENTINEL="$WORKSPACE/.arp_initialized"
 export ARP_DATA_DIR="${ARP_DATA_DIR:-$WORKSPACE/arp-data}"
 export ARP_CACHE_DIR="${ARP_CACHE_DIR:-$WORKSPACE/arp-cache}"
 export HF_HOME="${HF_HOME:-$ARP_CACHE_DIR/huggingface}"
+# Disable the Hugging Face Xet transfer backend: its background writer fails on RunPod
+# network volumes ("File reconstruction error: ... Background writer channel closed").
+# Falls back to plain HTTPS downloads, which write fine to the volume.
+export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 export AI_REMASTER_GUI_HOST="${AI_REMASTER_GUI_HOST:-0.0.0.0}"
 export AI_REMASTER_GUI_PORT="${AI_REMASTER_GUI_PORT:-8765}"
 export AI_REMASTER_NO_BROWSER=1
