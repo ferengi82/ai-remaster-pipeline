@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import queue
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from comfy_api import ensure_node_types, extract_output_files, object_info, queue_prompt, wait_for_comfy, wait_for_prompt
 from common import ROOT, copy_to_comfy_input, file_fingerprint, find_ffmpeg, load_local_config, newest_output as newest_comfy_output, replace_unless_identical, replace_with_retry, resolve_path, root_relative, safe_stem, resumable_output, split_matches_source, video_info, write_signature, write_split_sidecar
@@ -18,6 +23,109 @@ from common import CACHE_ROOT
 
 
 config = load_local_config()
+
+
+_LOG_LOCK = threading.Lock()
+# Suppress ffmpeg's banner + per-frame stats by default (they drowned out the useful log lines);
+# set ARP_LOG_FFMPEG=1 to restore the full ffmpeg output for debugging.
+_FFMPEG_VERBOSE = os.environ.get("ARP_LOG_FFMPEG", "").strip().lower() in ("1", "true", "yes")
+
+
+def log(message: str) -> None:
+    """Thread-safe stdout line — parallel chunk workers log concurrently."""
+    with _LOG_LOCK:
+        print(message, flush=True)
+
+
+def run_ffmpeg(command: list[str]) -> None:
+    """Run an ffmpeg command quietly (banner/stats hidden) unless ARP_LOG_FFMPEG=1.
+    Errors are still printed (loglevel error) and a non-zero exit still raises (check=True)."""
+    if command and not _FFMPEG_VERBOSE and "-loglevel" not in command:
+        command = [command[0], "-hide_banner", "-loglevel", "error", "-nostats", *command[1:]]
+    subprocess.run(command, check=True)
+
+
+def gpu_label(comfy_url: str) -> str:
+    """Human label for a ComfyUI instance, e.g. 'GPU2 :8190' (instance 0 = port 8188)."""
+    try:
+        port = urlparse(comfy_url).port or 0
+    except ValueError:
+        port = 0
+    if port >= 8188:
+        return f"GPU{port - 8188} :{port}"
+    return comfy_url
+
+
+def fmt_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def _ws_progress_listener(comfy_url: str, client_id: str, prompt_id: str, label: str,
+                          node_titles: dict[str, str], stop_event: threading.Event) -> None:
+    """Best-effort: stream ComfyUI execution progress for our prompt into the log via the
+    /ws websocket. Any failure (no aiohttp, connection error) silently disables it, so the
+    upscale run is never affected."""
+    try:
+        import asyncio
+
+        import aiohttp
+    except Exception:
+        return
+    ws_url = comfy_url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://") + f"/ws?clientId={client_id}"
+
+    async def _run() -> None:
+        last_node = ""
+        last_pct = -1
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(ws_url, heartbeat=20) as ws:
+                while not stop_event.is_set():
+                    try:
+                        msg = await asyncio.wait_for(ws.receive(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        continue
+                    try:
+                        event = json.loads(msg.data)
+                    except Exception:
+                        continue
+                    data = event.get("data") or {}
+                    if data.get("prompt_id") not in (None, prompt_id):
+                        continue
+                    etype = event.get("type")
+                    if etype == "executing":
+                        node = data.get("node")
+                        if node is None:
+                            break  # this client's prompt finished executing
+                        name = node_titles.get(str(node), str(node))
+                        if name != last_node:
+                            last_node, last_pct = name, -1
+                            log(f"  {label}  {name} …")
+                    elif etype == "progress":
+                        value = int(data.get("value") or 0)
+                        maximum = int(data.get("max") or 0)
+                        if maximum:
+                            pct = value * 100 // maximum
+                            if pct >= last_pct + 10 or value >= maximum:
+                                last_pct = pct
+                                name = node_titles.get(str(data.get("node")), last_node or "")
+                                log(f"  {label}  {name} step {value}/{maximum}")
+                    elif etype in ("execution_success", "execution_error", "execution_interrupted"):
+                        break
+
+    try:
+        asyncio.run(_run())
+    except Exception:
+        pass
 
 
 def default_output(source: Path, width: int, height: int) -> Path:
@@ -209,9 +317,23 @@ def flashvsr_run(args: argparse.Namespace, source: Path, partial: Path, output_w
     fps = args.fps or float(video_info(source)["fps"])
     prefix = f"arp_upscale/{safe_stem(source.name)}_flashvsr_{output_width}x{output_height}"
     prompt = flashvsr_prompt(video_name, fps, args, prefix, info)
-    prompt_id = queue_prompt(comfy_url, prompt)
-    print(f"Queued ComfyUI prompt {prompt_id} on {comfy_url}", flush=True)
-    history = wait_for_prompt(comfy_url, prompt_id, args.poll_seconds)
+    client_id = str(uuid.uuid4())
+    node_titles = {node_id: node.get("class_type", node_id) for node_id, node in prompt.items()}
+    label = gpu_label(comfy_url)
+    prompt_id = queue_prompt(comfy_url, prompt, client_id=client_id)
+    log(f"  {label} queued prompt {prompt_id}")
+    stop_event = threading.Event()
+    listener = threading.Thread(
+        target=_ws_progress_listener,
+        args=(comfy_url, client_id, prompt_id, label, node_titles, stop_event),
+        daemon=True,
+    )
+    listener.start()
+    try:
+        history = wait_for_prompt(comfy_url, prompt_id, args.poll_seconds)
+    finally:
+        stop_event.set()
+        listener.join(timeout=3)
     produced = newest_comfy_output(extract_output_files(history, comfy_output_root), {".mp4", ".mov", ".mkv", ".webm"}, "FlashVSR video")
     partial.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(produced, partial)
@@ -268,7 +390,7 @@ def split_video_chunk(ffmpeg: str, source: Path, target: Path, start_frame: int,
         "+faststart",
         str(partial),
     ]
-    subprocess.run(command, check=True)
+    run_ffmpeg(command)
     replace_unless_identical(partial, target, f"Upscale prepared chunk {target.name}")
     write_split_sidecar(target, source, source_fingerprint)
 
@@ -308,7 +430,7 @@ def normalize_chunk(ffmpeg: str, source: Path, target: Path, width: int, height:
         "+faststart",
         str(partial),
     ]
-    subprocess.run(command, check=True)
+    run_ffmpeg(command)
     replace_with_retry(partial, target, f"Upscale normalized chunk {target.name}")
 
 
@@ -321,9 +443,8 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], source: Path, output: Path) -
     with tempfile.TemporaryDirectory(prefix="arp_upscale_concat_") as tmp_text:
         list_file = Path(tmp_text) / "chunks.txt"
         list_file.write_text("".join(f"file '{chunk.as_posix()}'\n" for chunk in chunks), encoding="utf-8")
-        print(f"Stitching upscaled chunks: {len(chunks)} chunk(s)", flush=True)
-        subprocess.run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(video_partial)], check=True)
-    print("Muxing original audio into upscaled video", flush=True)
+        log(f"[upscale] Stitching {len(chunks)} chunk(s) + muxing original audio")
+        run_ffmpeg([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(video_partial)])
     mux_command = [
         ffmpeg,
         "-y",
@@ -344,7 +465,7 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], source: Path, output: Path) -
         "+faststart",
         str(final_partial),
     ]
-    subprocess.run(mux_command, check=True)
+    run_ffmpeg(mux_command)
     video_partial.unlink(missing_ok=True)
     replace_with_retry(final_partial, output, "Upscaled output")
 
@@ -369,7 +490,7 @@ def ensure_flashvsr_model(args: argparse.Namespace) -> None:
         from huggingface_hub import snapshot_download
     except Exception:
         return  # Fall back to the node's own downloader (fine on the single-instance path).
-    print(f"Ensuring FlashVSR model '{model}' is present (one-time download)...", flush=True)
+    log(f"[upscale] Ensuring FlashVSR model '{model}' is present (one-time download)…")
     snapshot_download(repo_id=f"JunhaoZhuang/{model}", local_dir=str(model_dir),
                       local_dir_use_symlinks=False, resume_download=True)
 
@@ -384,7 +505,7 @@ def chunked_flashvsr_run(args: argparse.Namespace, source: Path, output: Path, o
         for path in (raw_partial, final_partial):
             if path.exists():
                 path.unlink()
-        print(f"Queueing FlashVSR in ComfyUI: {source}", flush=True)
+        log(f"[upscale] Single clip (no chunking) → {gpu_label(args.comfy_url)}")
         flashvsr_run(args, source, raw_partial, output_width, output_height)
         if not raw_partial.exists():
             raise RuntimeError(f"FlashVSR finished but did not create expected output: {raw_partial}")
@@ -407,16 +528,35 @@ def chunked_flashvsr_run(args: argparse.Namespace, source: Path, output: Path, o
     # instance. A single URL behaves exactly like the old sequential loop.
     urls = [u.strip() for u in (getattr(args, "comfy_urls", "") or "").split(",") if u.strip()] or [args.comfy_url]
     workers = max(1, len(urls))
-    print(f"Splitting upscaling into {len(ranges)} chunk(s): {args.chunk_seconds:g}s chunks, {max(0, args.overlap_frames)} overlap frame(s); {workers} GPU worker(s)", flush=True)
+    total = len(ranges)
+    log(f"[upscale] {total} chunk(s) · {args.chunk_seconds:g}s each · {max(0, args.overlap_frames)} overlap frame(s) · {workers} GPU worker(s) → {output_width}×{output_height}")
     # Pre-download the FlashVSR weights once before fanning chunks out: the node's own
     # downloader races across parallel instances (it guards on the dir, not the files).
     if workers > 1:
         ensure_flashvsr_model(args)
-    digits = max(4, int(math.log10(len(ranges))) + 1)
+    digits = max(4, int(math.log10(total)) + 1)
 
     url_pool: "queue.Queue[str]" = queue.Queue()
     for url in urls:
         url_pool.put(url)
+
+    run_start = time.monotonic()
+    progress_lock = threading.Lock()
+    progress = {"done": 0}
+    durations: list[float] = []
+
+    def note_done(index: int, elapsed: float | None) -> None:
+        """Log a chunk completion with a running counter and ETA from the rolling average."""
+        with progress_lock:
+            progress["done"] += 1
+            done = progress["done"]
+            if elapsed is not None:
+                durations.append(elapsed)
+            avg = (sum(durations) / len(durations)) if durations else 0.0
+            eta = avg * (total - done) / max(1, workers)
+            took = "reuse" if elapsed is None else fmt_duration(elapsed)
+            eta_text = f" · ETA ~{fmt_duration(eta)}" if (avg and done < total) else ""
+            log(f"[upscale] Chunk {index + 1:>{len(str(total))}}/{total} ✓ {took}  (Ø {fmt_duration(avg)} · {done}/{total} fertig{eta_text})")
 
     def process_chunk(index: int, start_frame: int, end_frame: int, trim_start: int) -> Path:
         chunk_input = chunk_dir / f"input_{index:0{digits}d}_{start_frame:06d}_{end_frame:06d}.mp4"
@@ -425,18 +565,19 @@ def chunked_flashvsr_run(args: argparse.Namespace, source: Path, output: Path, o
         split_video_chunk(ffmpeg, source, chunk_input, start_frame, end_frame, fps, args.force, source_fingerprint)
         chunk_sig = signature(args, chunk_input, output_width, output_height)
         if not args.force and resumable_output(chunk_final, chunk_sig, width=output_width, height=output_height):
-            print(f"Reuse upscaled chunk {index + 1}/{len(ranges)}: {chunk_final}", flush=True)
+            note_done(index, None)
             return chunk_final
         url = url_pool.get()
+        chunk_start = time.monotonic()
         try:
-            print(f"Upscale chunk {index + 1}/{len(ranges)} on {url}: frames {start_frame}-{end_frame}, trim {trim_start}", flush=True)
+            log(f"[upscale] Chunk {index + 1:>{len(str(total))}}/{total} → {gpu_label(url)}  Frames {start_frame}–{end_frame}")
             flashvsr_run(args, chunk_input, chunk_raw, output_width, output_height, comfy_url=url)
         finally:
             url_pool.put(url)
         normalize_chunk(ffmpeg, chunk_raw, chunk_final, output_width, output_height, trim_start, fps, True)
         write_signature(chunk_final, chunk_sig)
         chunk_raw.unlink(missing_ok=True)
-        print(f"Wrote upscaled chunk {index + 1}/{len(ranges)}: {chunk_final}", flush=True)
+        note_done(index, time.monotonic() - chunk_start)
         return chunk_final
 
     results: dict[int, Path] = {}
@@ -452,6 +593,15 @@ def chunked_flashvsr_run(args: argparse.Namespace, source: Path, output: Path, o
     if output.exists():
         output.unlink()
     stitch_chunks(ffmpeg, normalized_chunks, source, output)
+
+    total_elapsed = time.monotonic() - run_start
+    avg = (sum(durations) / len(durations)) if durations else 0.0
+    try:
+        size_mb = output.stat().st_size / (1024 * 1024)
+    except OSError:
+        size_mb = 0.0
+    log(f"[upscale] Fertig: {total} Chunks in {fmt_duration(total_elapsed)} (Ø {fmt_duration(avg)}/Chunk) · "
+        f"{workers} GPU(s) · {output_width}×{output_height} · {size_mb:.0f} MB → {output}")
 
 
 def fit_dimensions(source_width: int, source_height: int, target_width: int, target_height: int) -> tuple[int, int]:
@@ -484,7 +634,7 @@ def scale_video(ffmpeg: str, source: Path, output: Path, width: int, height: int
         "+faststart",
         str(output),
     ]
-    subprocess.run(command, check=True)
+    run_ffmpeg(command)
 
 
 def run(args: argparse.Namespace) -> int:

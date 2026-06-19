@@ -43,6 +43,9 @@ MMAudio/Stable Audio are tens of GB — **150 GB+ recommended**).
 | `ARP_WORKSPACE` | `/workspace` | Volume mount path (match the RunPod mount). |
 | `ARP_COMFY_GPUS` | _(auto)_ | Number of ComfyUI instances to start. Auto-detected from the GPU count (`nvidia-smi`); set e.g. `1` to force single-GPU or cap it. |
 | `AI_REMASTER_ALLOWED_HOSTS` | _(auto)_ | Hostnames the GUI answers to. The GUI rejects non-loopback `Host`/`Origin` headers (DNS-rebinding guard), which would 403 the RunPod proxy URL. The entrypoint auto-allows `<pod>-<port>.proxy.runpod.net` (from `RUNPOD_POD_ID`), falling back to `*` (any host) if the pod id is unknown. Set a comma-separated list, or `*`, to override. |
+| `ARP_SHUTDOWN_AFTER_UPSCALE` | _(off)_ | Set `stop` to pause the pod (keeps pod + volume, ends GPU billing) or `terminate` to delete it (data on `/workspace` survives) once the **Upscale** stage finishes — success *or* failure. Great for unattended multi-GPU jobs. Uses the RunPod API if `RUNPOD_API_KEY` is set, else the on-pod `runpodctl`. |
+| `RUNPOD_API_KEY` | – | RunPod API key for a reliable `ARP_SHUTDOWN_AFTER_UPSCALE`. Without it the shutdown falls back to `runpodctl`, which may not be authorized on every pod. |
+| `ARP_LOG_FFMPEG` | `0` | Set `1` to restore ffmpeg's full banner/per-frame output in logs (default hides it so the structured upscale progress lines are readable). |
 | `ARP_ENABLE_FILES` | `1` | Set `0` to disable the web file manager. |
 | `ARP_FILES_PORT` | `8888` | File manager port. |
 | `ARP_FILES_USER` | `admin` | File manager login user. |

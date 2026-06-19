@@ -1779,6 +1779,19 @@ class PipelineApp:
                 self.hydrate_stage_inputs(stage_key)
             elif code == 0 and stage_key == "upscale_preview":
                 self.log.append("Upscale preview ready.")
+        # Optional unattended shutdown: power the (RunPod) pod down once the upscale stage ends,
+        # regardless of exit code, when ARP_SHUTDOWN_AFTER_UPSCALE=stop|terminate is set. Done
+        # outside the lock because the shutdown call blocks on network/CLI.
+        if stage_key == "upscale":
+            action = os.environ.get("ARP_SHUTDOWN_AFTER_UPSCALE", "").strip()
+            if action:
+                from .pod_control import shutdown_pod
+
+                def _append(message: str) -> None:
+                    with self.lock:
+                        self.log.append(message)
+
+                shutdown_pod(action, log=_append)
 
     def stop(self) -> None:
         with self.lock:
