@@ -1267,6 +1267,59 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(plan[1]["base_start"], 7)
         self.assertEqual(plan[1]["base_end"], 20)
 
+    def test_colorize_segment_signature_tracks_full_shot_inputs_for_each_method(self) -> None:
+        def args_for(method: str) -> argparse.Namespace:
+            return argparse.Namespace(
+                method=method,
+                frame_propagate=True,
+                use_half_resolution=True,
+                use_torch_compile=False,
+                use_sage_attention=False,
+                colormnet_memory_mode="balanced",
+                colormnet_feature_encoder="resnet50",
+                colormnet_text_guidance="",
+                colormnet_text_guidance_weight=0.3,
+                video_format="video/h264-mp4",
+                crf=18,
+            )
+
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.mp4"
+            source_reference = folder / "source.png"
+            color_reference = folder / "color.png"
+            source.write_bytes(b"video bytes")
+            source_reference.write_bytes(b"source reference")
+            color_reference.write_bytes(b"color reference")
+            row = {
+                "enabled": "true",
+                "start_frame": "0",
+                "end_frame": "10",
+                "selected_frame": "4",
+                "end": "00:00:00.417",
+                "source_reference": app.rel(source_reference),
+                "color_reference": app.rel(color_reference),
+                "prompt": "",
+                "fade_to_next": "false",
+                "crossfade_seconds": "",
+            }
+
+            deep = colorize_video.segment_signature(args_for("deepexemplar"), source, row, color_reference, 0, 10, 0, 10, 640, 360, 24.0)
+            color = colorize_video.segment_signature(args_for("colormnet"), source, row, color_reference, 0, 10, 0, 10, 640, 360, 24.0)
+            prompted = dict(row)
+            prompted["prompt"] = "warmer faces"
+            deep_prompted = colorize_video.segment_signature(args_for("deepexemplar"), source, prompted, color_reference, 0, 10, 0, 10, 640, 360, 24.0)
+            color_prompted = colorize_video.segment_signature(args_for("colormnet"), source, prompted, color_reference, 0, 10, 0, 10, 640, 360, 24.0)
+            color_reference.write_bytes(b"new color reference")
+            deep_changed_ref = colorize_video.segment_signature(args_for("deepexemplar"), source, row, color_reference, 0, 10, 0, 10, 640, 360, 24.0)
+            color_changed_ref = colorize_video.segment_signature(args_for("colormnet"), source, row, color_reference, 0, 10, 0, 10, 640, 360, 24.0)
+
+        self.assertEqual(deep["shot_input"], color["shot_input"])
+        self.assertNotEqual(deep["shot_input"], deep_prompted["shot_input"])
+        self.assertNotEqual(color["shot_input"], color_prompted["shot_input"])
+        self.assertNotEqual(deep["shot_input"], deep_changed_ref["shot_input"])
+        self.assertNotEqual(color["shot_input"], color_changed_ref["shot_input"])
+
     def test_colorize_crossfade_rebuilds_frame_timestamps_before_fps(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
             folder = Path(tmp_text)
@@ -1917,6 +1970,22 @@ class GuiSmokeTests(unittest.TestCase):
             common.copy_to_comfy_input(source, folder, "arp_outpaint")
 
             self.assertEqual(target.read_bytes(), b"metropolis bytes")
+
+    def test_colorize_reference_copy_names_are_content_keyed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            reference = folder / "shot_ref.png"
+            reference.write_bytes(b"first reference")
+
+            first = colorize_video.copy_reference_to_comfy_input(reference, folder)
+            again = colorize_video.copy_reference_to_comfy_input(reference, folder)
+            reference.write_bytes(b"changed reference")
+            second = colorize_video.copy_reference_to_comfy_input(reference, folder)
+
+            self.assertEqual(first, again)
+            self.assertNotEqual(first, second)
+            self.assertEqual((folder / "input" / Path(first)).read_bytes(), b"first reference")
+            self.assertEqual((folder / "input" / Path(second)).read_bytes(), b"changed reference")
 
     def test_guide_copy_names_are_content_keyed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:

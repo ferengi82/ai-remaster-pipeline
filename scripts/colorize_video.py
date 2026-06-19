@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ from common import DATA_ROOT
 from common import CACHE_ROOT
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
+REFERENCE_INPUT_COPY_STRATEGY = "content-keyed-v1"
 
 
 def read_manifest(path: Path) -> tuple[str | None, list[dict[str, str]]]:
@@ -67,6 +69,21 @@ def method_suffix(method: str) -> str:
     return "colormnet" if method == "colormnet" else "deepexemplar"
 
 
+def copy_reference_to_comfy_input(reference: Path, comfy_dir: Path) -> str:
+    target_dir = comfy_dir / "input" / "arp_colorize_refs"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    digest = file_fingerprint(reference)["sha256"][:12]
+    suffix = reference.suffix.lower() or ".png"
+    target = target_dir / f"{safe_stem(reference.stem)}_{digest}{suffix}"
+    if (
+        not target.exists()
+        or target.stat().st_size != reference.stat().st_size
+        or file_fingerprint(target)["sha256"] != file_fingerprint(reference)["sha256"]
+    ):
+        shutil.copy2(reference, target)
+    return str(Path("arp_colorize_refs") / target.name).replace("\\", "/")
+
+
 def default_output(manifest: Path, manifest_source: str | None, method: str) -> Path:
     # Match the artifact name the GUI locates by (references.colorized_output_for_manifest), so the
     # method="both" path — the only path that reaches default_output, since single methods get an
@@ -91,20 +108,70 @@ def reference_signature(row: dict[str, str]) -> dict[str, Any]:
     }
 
 
+def row_path_signature(row: dict[str, str], key: str) -> dict[str, Any]:
+    text = row.get(key, "")
+    if not text:
+        return {"path": ""}
+    path = resolve_path(text)
+    sig: dict[str, Any] = {"path": root_relative(path)}
+    if path.exists():
+        sig["fingerprint"] = file_fingerprint(path)
+    else:
+        sig["missing"] = True
+    return sig
+
+
+def shot_input_signature(row: dict[str, str]) -> dict[str, Any]:
+    """Everything about a manifest row that can make a cached shot segment stale."""
+    ref = row_reference(row)
+    return {
+        "row": {key: row.get(key, "") for key in sorted(row)},
+        "source_reference": row_path_signature(row, "source_reference"),
+        "color_reference": row_path_signature(row, "color_reference"),
+        "reference": root_relative(ref),
+        "reference_fingerprint": file_fingerprint(ref),
+    }
+
+
+def method_settings_signature(args: argparse.Namespace) -> dict[str, Any]:
+    settings = {
+        "method": args.method,
+        "use_torch_compile": args.use_torch_compile,
+        "video_format": args.video_format,
+        "crf": args.crf,
+    }
+    if args.method == "colormnet":
+        settings.update(
+            {
+                "colormnet_memory_mode": args.colormnet_memory_mode,
+                "colormnet_feature_encoder": args.colormnet_feature_encoder,
+                "colormnet_text_guidance": args.colormnet_text_guidance,
+                "colormnet_text_guidance_weight": args.colormnet_text_guidance_weight,
+            }
+        )
+    else:
+        settings.update(
+            {
+                "frame_propagate": args.frame_propagate,
+                "use_half_resolution": args.use_half_resolution,
+                "use_sage_attention": args.use_sage_attention,
+            }
+        )
+    return settings
+
+
 def signature(args: argparse.Namespace, manifest: Path, source_video: Path, rows: list[dict[str, str]]) -> dict[str, Any]:
     return {
-        "version": 4,
+        "version": 6,
         "tool": "colorize_video.py",
+        "reference_input_copy": REFERENCE_INPUT_COPY_STRATEGY,
         "manifest": root_relative(manifest),
         "manifest_fingerprint": file_fingerprint(manifest),
         "source_video": root_relative(source_video),
         "source_fingerprint": file_fingerprint(source_video),
         "references": [reference_signature(row) for row in rows],
-        "method": args.method,
-        "frame_propagate": args.frame_propagate,
-        "use_half_resolution": args.use_half_resolution,
-        "use_torch_compile": args.use_torch_compile,
-        "use_sage_attention": args.use_sage_attention,
+        "shot_inputs": [shot_input_signature(row) for row in rows],
+        "settings": method_settings_signature(args),
     }
 
 
@@ -216,13 +283,15 @@ def segment_signature(
     fps: float,
 ) -> dict[str, Any]:
     return {
-        "version": 4,
+        "version": 6,
         "tool": "colorize_video.py",
         "kind": f"{args.method} segment",
+        "reference_input_copy": REFERENCE_INPUT_COPY_STRATEGY,
         "source_video": root_relative(source_video),
         "source_fingerprint": file_fingerprint(source_video),
         "reference": root_relative(reference),
         "reference_fingerprint": file_fingerprint(reference),
+        "shot_input": shot_input_signature(row),
         "row_start": row.get("start", ""),
         "row_end": row.get("end", ""),
         "start_frame": start_frame,
@@ -234,15 +303,7 @@ def segment_signature(
         "width": width,
         "height": height,
         "fps": fps,
-        "frame_propagate": args.frame_propagate,
-        "use_half_resolution": args.use_half_resolution,
-        "use_torch_compile": args.use_torch_compile,
-        "use_sage_attention": args.use_sage_attention,
-        "colormnet_memory_mode": args.colormnet_memory_mode,
-        "colormnet_feature_encoder": args.colormnet_feature_encoder,
-        "colormnet_text_guidance": args.colormnet_text_guidance,
-        "video_format": args.video_format,
-        "crf": args.crf,
+        "settings": method_settings_signature(args),
     }
 
 
@@ -559,7 +620,7 @@ def run(args: argparse.Namespace) -> int:
         end_frame = item["end"]
         frame_count = max(1, end_frame - start_frame)
         reference = row_reference(row)
-        ref_name = copy_to_comfy_input(reference, comfy_dir, "arp_colorize_refs")
+        ref_name = copy_reference_to_comfy_input(reference, comfy_dir)
         chunk = cache_dir / f"segment_{index:04d}_{start_frame:06d}_{end_frame:06d}.mp4"
         chunk_sig = segment_signature(args, source_video, row, reference, start_frame, end_frame, item["base_start"], item["base_end"], width, height, fps)
         if not args.force and segment_resumable(chunk, chunk_sig, width, height, frame_count):
