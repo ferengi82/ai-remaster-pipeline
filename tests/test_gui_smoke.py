@@ -26,8 +26,10 @@ import common  # noqa: E402
 import colorize_video  # noqa: E402
 import create_audio_track  # noqa: E402
 import generate_single_reference  # noqa: E402
+import generate_references  # noqa: E402
 import guide_frame_utils  # noqa: E402
 import edit_reference_image  # noqa: E402
+import final_composite  # noqa: E402
 import openai_generate_reference  # noqa: E402
 import outpaint_video  # noqa: E402
 import prepare_outpaint_input  # noqa: E402
@@ -37,23 +39,99 @@ import upscale_video  # noqa: E402
 from ai_remaster_gui import app
 from ai_remaster_gui import config
 from ai_remaster_gui import lifecycle
+from ai_remaster_gui import media
 from ai_remaster_gui import outpaint_guides
 from ai_remaster_gui import project_io
 from ai_remaster_gui import sam_masks
 from ai_remaster_gui import server
+from ai_remaster_gui import system_status
 
 
 class GuiSmokeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Isolate the suite from the developer's live .ai_remaster_gui.json regardless of how it is
+        # launched. In particular `unittest discover -s tests` imports sibling test modules (which
+        # pull in ai_remaster_gui.config) before tests/__init__.py runs, so the ARP_SETTINGS_FILE
+        # redirect there can lose the import race and app.APP would load real settings. Redirect the
+        # load and save paths to a throwaway file here and rebuild settings from defaults, then
+        # snapshot that as the per-test baseline (setUp resets to a deep copy of it each test).
+        tmp_settings = Path(tempfile.mkdtemp(prefix="arp-test-settings-")) / "settings.json"
+        for target in (app, server):
+            patcher = mock.patch.object(target, "SETTINGS_FILE", tmp_settings)
+            patcher.start()
+            cls.addClassCleanup(patcher.stop)
+        app.APP.settings = server.load_settings()
+        cls._pristine_settings = copy.deepcopy(app.APP.settings)
+
     def setUp(self) -> None:
-        self._settings = copy.deepcopy(app.APP.settings)
+        app.APP.settings = copy.deepcopy(self._pristine_settings)
         # Default the soundtrack phase off so stage-order / upscale-chaining tests are not
         # affected by whatever add_soundtrack happens to be in the loaded settings.
         app.APP.settings.setdefault("global", {})["add_soundtrack"] = "false"
         app.APP.quitting = False
 
     def tearDown(self) -> None:
-        app.APP.settings = self._settings
         app.APP.quitting = False
+
+    def _populate_full_pipeline_settings(self) -> None:
+        """Populate settings so command_for can build a full command for every stage. Used by the
+        stage-dispatch characterization tests below, which guard the per-stage routing while it is
+        being consolidated out of the if/elif chains."""
+        app.APP.settings["global"].update({
+            "source": "input/fixture_clip.mp4", "section_start": "0", "section_end": "",
+            "expand_outpaint": "true", "colorize": "true", "upscale": "true", "add_soundtrack": "true",
+        })
+        app.APP.settings["shots"]["outpainted_video"] = "intermediate/outpainted/Fixture_outpaint.mp4"
+        app.APP.settings["references"].update({"manifest": "manifests/references/Fixture_shots.csv", "method": "qwen"})
+        app.APP.settings["colour"]["manifest"] = "manifests/references/Fixture_shots.csv"
+        app.APP.settings["recomp"].update({
+            "outpainted_video": "intermediate/outpainted/Fixture_outpaint.mp4",
+            "source": "input/fixture_clip.mp4",
+            "colorized_video": "intermediate/outpainted_colorized/Fixture_color.mp4",
+        })
+        app.APP.settings["audio"]["input_video"] = "output/reassembled/Fixture_recomp.mp4"
+        app.APP.settings["upscale"]["input_video"] = "output/reassembled/Fixture_recomp.mp4"
+
+    def test_stage_commands_route_to_expected_scripts(self) -> None:
+        # Characterization guard: every stage's command_for must launch its producer script via
+        # `python -u <script>`. Protects the dispatch while it is consolidated into a stage registry.
+        self._populate_full_pipeline_settings()
+        expected = {
+            "outpaint": "outpaint_video.py",
+            "shots": "generate_references.py",
+            "references": "qwen_colorize_references.py",
+            "colour": "colorize_video.py",
+            "recomp": "final_composite.py",
+            "audio": "create_audio_track.py",
+            "upscale": "upscale_video.py",
+        }
+        for key, script in expected.items():
+            cmd = app.APP.command_for(key)
+            self.assertTrue(cmd, f"{key} produced an empty command")
+            self.assertEqual(cmd[:2], [sys.executable, "-u"], key)
+            self.assertEqual([Path(p).name for p in cmd if p.endswith(".py")], [script], key)
+        # The reference stage swaps scripts by method.
+        app.APP.settings["references"]["method"] = "openai"
+        self.assertIn("openai_generate_reference.py", [Path(p).name for p in app.APP.command_for("references")])
+
+    def test_active_stages_for_global_flag_combinations(self) -> None:
+        # Characterization guard for which phases run per global-toggle combination. Recomposition
+        # is implied by outpaint OR colorize; audio and upscale are independent tail stages.
+        def active(expand: str, colorize: str, soundtrack: str, upscale: str) -> list[str]:
+            app.APP.settings["global"].update({
+                "expand_outpaint": expand, "colorize": colorize,
+                "add_soundtrack": soundtrack, "upscale": upscale,
+            })
+            return [stage.key for stage in app.APP.active_stages()]
+
+        T, F = "true", "false"
+        self.assertEqual(active(T, T, T, T), ["outpaint", "shots", "references", "colour", "recomp", "audio", "upscale"])
+        self.assertEqual(active(T, F, F, F), ["outpaint", "recomp"])
+        self.assertEqual(active(F, T, F, F), ["shots", "references", "colour", "recomp"])
+        self.assertEqual(active(F, F, F, T), ["upscale"])
+        self.assertEqual(active(F, F, T, F), ["audio"])
+        self.assertEqual(active(F, F, F, F), [])
 
     def test_source_resolver_accepts_ascii_pipe_for_full_width_pipe_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
@@ -202,6 +280,7 @@ class GuiSmokeTests(unittest.TestCase):
 
         filter_text = prepare_outpaint_input.build_filter(args, info, 1280, 704)
 
+        self.assertIn("trim=start_frame=0,setpts=N/(24.00000000*TB),fps=24.00000000", filter_text)
         self.assertIn("crop=w=1440:h=540:x=0:y=270,scale=w=960:h=360:flags=lanczos,scale=w=960:h=352:flags=lanczos", filter_text)
         self.assertNotIn("force_original_aspect_ratio=decrease", filter_text)
 
@@ -250,6 +329,54 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertNotEqual(output_black, output_plain)
         self.assertTrue(prepared_black.name.startswith("My_prepared_"), prepared_black.name)
         self.assertIn("--outpaint-all-black-regions", command)
+
+    def test_final_composite_can_make_source_black_transparent(self) -> None:
+        args = final_composite.build_parser().parse_args(
+            [
+                "--outpainted", "outpainted.mp4",
+                "--source", "source.mp4",
+                "--output", "final.mp4",
+                "--source-black-transparent",
+                "--source-black-threshold", "12",
+            ]
+        )
+
+        filter_text = final_composite.build_filter(args, has_color=False, fps=24.0)
+
+        self.assertIn("[0:v]setpts=N/(24.00000000*TB),fps=fps=24.00000000", filter_text)
+        self.assertIn("[1:v]setpts=N/(24.00000000*TB),fps=fps=24.00000000", filter_text)
+        self.assertIn("a='if(lte(min(", filter_text)
+        self.assertIn("min(max(X-2,0),W-1)", filter_text)
+        self.assertIn(",12),0,", filter_text)
+        self.assertIn("[base][srcm]overlay", filter_text)
+
+    def test_recomposition_command_punches_source_black_when_outpainting_all_black_regions(self) -> None:
+        app.APP.settings["global"].update({"source": "input/My Source.mp4", "section_start": "0", "section_end": ""})
+        app.APP.settings["outpaint"].update(
+            {
+                "target_aspect": "16:9",
+                "target_height": "720",
+                "crop_left": "0",
+                "crop_right": "0",
+                "crop_top": "0",
+                "crop_bottom": "0",
+                "outpaint_all_black_regions": "true",
+            }
+        )
+        app.APP.settings["recomp"].update(
+            {
+                "outpainted_video": "intermediate/outpainted/My_outpaint.mp4",
+                "source": "input/My Source.mp4",
+                "output": "output/reassembled/My_recomp.mp4",
+            }
+        )
+
+        command = app.APP.command_for("recomp")
+        app.APP.settings["outpaint"]["outpaint_all_black_regions"] = "false"
+        protected_command = app.APP.command_for("recomp")
+
+        self.assertIn("--source-black-transparent", command)
+        self.assertNotIn("--source-black-transparent", protected_command)
 
     def test_portable_comfy_parent_resolves_to_inner_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
@@ -317,6 +444,44 @@ class GuiSmokeTests(unittest.TestCase):
                 self.assertTrue(kwargs["creationflags"] & subprocess.CREATE_NEW_CONSOLE)
             self.assertTrue(log_path.exists())
             self.assertIn("Starting ComfyUI:", log_path.read_text(encoding="utf-8"))
+
+    def test_stage_comfy_gate_waits_for_existing_launch(self) -> None:
+        class FakeProcess:
+            returncode = None
+
+            def poll(self):
+                return None
+
+        fake_process = FakeProcess()
+        with (
+            mock.patch.object(lifecycle, "STARTED_COMFY_PROCESS", fake_process),
+            mock.patch.object(lifecycle, "current_config", return_value={"comfy_url": "http://127.0.0.1:8188"}),
+            mock.patch.object(lifecycle, "discover_comfy_instances", return_value=[]),
+            mock.patch.object(lifecycle, "comfy_is_running", side_effect=[False, True]) as is_running,
+            mock.patch.object(lifecycle.time, "sleep"),
+        ):
+            ok, message = lifecycle.ensure_comfy_available_for_stage("Outpainting")
+
+        self.assertTrue(ok)
+        self.assertEqual(message, "")
+        self.assertEqual(is_running.call_count, 2)
+
+    def test_wait_for_comfy_ready_clears_dead_launch_handle(self) -> None:
+        class ExitedProcess:
+            returncode = 1
+
+            def poll(self):
+                return 1
+
+        process = ExitedProcess()
+        with (
+            mock.patch.object(lifecycle, "STARTED_COMFY_PROCESS", process),
+            mock.patch.object(lifecycle, "comfy_is_running", return_value=False),
+        ):
+            ready = lifecycle.wait_for_comfy_ready("http://127.0.0.1:8188", process, timeout_seconds=1)
+            self.assertIsNone(lifecycle.STARTED_COMFY_PROCESS)
+
+        self.assertFalse(ready)
 
     def test_required_comfy_workflows_are_bundled(self) -> None:
         outpaint = app.ROOT / "workflows" / "outpaint_ltx" / "outpaint_LTX-IC.json"
@@ -579,6 +744,33 @@ class GuiSmokeTests(unittest.TestCase):
 
             self.assertIn("_ox+12_oy-4", rows[0]["prepared_path"])
             self.assertIn("_ox+12_oy-4", rows[0]["raw_path"])
+
+    def test_outpaint_auto_start_guide_defaults_on_and_can_be_disabled(self) -> None:
+        self.assertTrue(outpaint_video.auto_start_guide_enabled({}))
+        self.assertTrue(outpaint_video.auto_start_guide_enabled({"auto_start_guide": "true"}))
+        self.assertFalse(outpaint_video.auto_start_guide_enabled({"auto_start_guide": "false"}))
+
+    def test_outpaint_manifest_sync_preserves_auto_start_guide_override(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            manifest = folder / "chunks.csv"
+            outpaint_video.write_chunk_manifest(
+                manifest,
+                [
+                    {
+                        "chunk_index": "0",
+                        "start_frame": "0",
+                        "end_frame": "10",
+                        "seed": "42",
+                        "auto_start_guide": "false",
+                    }
+                ],
+            )
+
+            rows = outpaint_video.sync_chunk_manifest(manifest, [(0, 0, 10), (1, 8, 18)], 24.0, folder, 42)
+
+            self.assertEqual(rows[0]["auto_start_guide"], "false")
+            self.assertEqual(rows[1]["auto_start_guide"], "true")
 
     def test_colormnet_correlation_extension_install_is_opt_in(self) -> None:
         downloader_path = app.ROOT / "vendor" / "comfyui_custom_nodes" / "reference-video-colorization" / "colormnet" / "downloader.py"
@@ -1021,6 +1213,80 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(plan[1]["start"], 18)
         self.assertEqual(plan[1]["end"], 48)
 
+    def test_shot_manifest_writes_integer_frame_spans(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "source.mp4"
+            manifest = folder / "shots.csv"
+            info = generate_references.VideoInfo(width=16, height=9, fps=24.0, frame_count=20, duration=20 / 24.0)
+            rows = [
+                generate_references.ReferenceRow(0, 0, 7, 3, 3 / 24.0, folder / "a.png", folder / "a_color.png"),
+                generate_references.ReferenceRow(1, 7, 20, 9, 9 / 24.0, folder / "b.png", folder / "b_color.png"),
+            ]
+
+            generate_references.write_manifest(manifest, source, rows, info)
+            _source, fields, read_rows = app.read_manifest_details(manifest)
+
+        self.assertIn("start_frame", fields)
+        self.assertIn("end_frame", fields)
+        self.assertIn("selected_frame", fields)
+        self.assertEqual(read_rows[0]["start_frame"], "0")
+        self.assertEqual(read_rows[0]["end_frame"], "7")
+        self.assertEqual(read_rows[1]["start_frame"], "7")
+
+    def test_shot_rows_prefer_manifest_frames_over_rounded_seconds(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            manifest = Path(tmp_text) / "shots.csv"
+            with manifest.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=["enabled", "start_frame", "end_frame", "selected_frame", "end", "source_reference", "color_reference"],
+                )
+                writer.writeheader()
+                writer.writerow({"enabled": "true", "start_frame": "0", "end_frame": "7", "selected_frame": "3", "end": "0.250"})
+                writer.writerow({"enabled": "true", "start_frame": "7", "end_frame": "20", "selected_frame": "9", "end": "0.833"})
+
+            rows = app.shot_rows(str(manifest))
+
+        self.assertEqual(rows[0]["start_frame"], 0)
+        self.assertEqual(rows[0]["end_boundary_frame"], 7)
+        self.assertEqual(rows[1]["start_frame"], 7)
+        self.assertEqual(rows[1]["selected_frame"], 9)
+
+    def test_colorize_plan_prefers_manifest_frames_over_rounded_seconds(self) -> None:
+        rows = [
+            {"start_frame": "0", "end_frame": "7", "end": "0.250"},
+            {"start_frame": "7", "end_frame": "20", "end": "0.833"},
+        ]
+
+        plan, transitions = colorize_video.shot_plan(rows, total_frames=20, fps=24.0)
+
+        self.assertEqual(transitions, [0, 0])
+        self.assertEqual(plan[0]["base_start"], 0)
+        self.assertEqual(plan[0]["base_end"], 7)
+        self.assertEqual(plan[1]["base_start"], 7)
+        self.assertEqual(plan[1]["base_end"], 20)
+
+    def test_colorize_crossfade_rebuilds_frame_timestamps_before_fps(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            chunks = [folder / "a.mp4", folder / "b.mp4"]
+            for chunk in chunks:
+                chunk.write_bytes(b"placeholder")
+            output = folder / "xfade.mp4"
+
+            with (
+                mock.patch.object(colorize_video, "video_info", return_value={"frames": 24}),
+                mock.patch.object(colorize_video.subprocess, "run") as run,
+                mock.patch.object(colorize_video, "replace_with_retry"),
+            ):
+                colorize_video.xfade_group("ffmpeg", chunks, [6], output, 24.0)
+
+        command = run.call_args.args[0]
+        filter_text = command[command.index("-filter_complex") + 1]
+        self.assertIn("[0:v]setpts=N/(24.00000000*TB),fps=fps=24.00000000[v0]", filter_text)
+        self.assertIn("[1:v]setpts=N/(24.00000000*TB),fps=fps=24.00000000[v1]", filter_text)
+
     def test_outpaint_overlap_context_stops_before_guide_inside_overlap(self) -> None:
         self.assertEqual(outpaint_video.overlap_context_before_anchor(8, "0.125", 24.0, 100), 3)
         self.assertEqual(outpaint_video.overlap_context_before_anchor(8, "1.0", 24.0, 100), 8)
@@ -1238,6 +1504,7 @@ class GuiSmokeTests(unittest.TestCase):
             with (
                 mock.patch.object(server, "current_config", return_value={"comfy_dir": str(comfy)}),
                 mock.patch.object(server, "ROOT", Path(tmp_text)),
+                mock.patch.object(server, "CACHE_ROOT", Path(tmp_text) / ".cache"),
                 mock.patch.object(server.webbrowser, "open", return_value=True) as open_browser,
                 mock.patch.object(server, "ensure_comfy_available_for_stage") as ensure_comfy,
             ):
@@ -1307,7 +1574,10 @@ class GuiSmokeTests(unittest.TestCase):
                     "section_end": "",
                 }
             )
-            with mock.patch.object(server, "ROOT", root):
+            with (
+                mock.patch.object(server, "ROOT", root),
+                mock.patch.object(server, "CACHE_ROOT", root / ".cache"),
+            ):
                 payload = app.APP.state("audio")
 
             stems = {row["key"]: row for row in payload["audio_stems"]}
@@ -1333,6 +1603,54 @@ class GuiSmokeTests(unittest.TestCase):
         app.APP.settings["global"].update({"source": "input/example.mp4", "section_start": "12", "section_end": "24"})
 
         self.assertIn("source_sections", app.pipeline_source_text(app.APP.settings))
+
+    def test_existing_source_section_with_late_first_pts_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            clip = Path(tmp_text) / "section.mp4"
+            clip.write_bytes(b"placeholder")
+
+            with mock.patch.object(media, "source_section_timing", return_value={"first_pts": 5.249, "duration": 68.351}):
+                self.assertFalse(media.source_section_clip_is_valid(clip, "ffmpeg", 63.062))
+
+    def test_source_section_trim_resets_video_and_audio_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            root = Path(tmp_text)
+            source = root / "input" / "example.mkv"
+            source.parent.mkdir()
+            source.write_bytes(b"source")
+            settings = {
+                "global": {
+                    "source": str(source),
+                    "section_start": "12",
+                    "section_end": "24",
+                }
+            }
+            ffmpeg_commands: list[list[str]] = []
+
+            def fake_run(command, **_kwargs):
+                if command[0] == "ffprobe":
+                    return subprocess.CompletedProcess(command, 0, stdout='{"streams":[{"index":1}]}', stderr="")
+                ffmpeg_commands.append(command)
+                Path(command[-1]).write_bytes(b"trimmed")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with (
+                mock.patch.object(media, "ROOT", root),
+                mock.patch.object(media, "DATA_ROOT", root),
+                mock.patch.object(media, "local_tool", return_value="ffmpeg"),
+                mock.patch.object(media.subprocess, "run", side_effect=fake_run),
+            ):
+                output = media.ensure_source_section_clip(settings)
+
+            self.assertIn("intermediate/source_sections/example_", output)
+            self.assertEqual(len(ffmpeg_commands), 1)
+            command = ffmpeg_commands[0]
+            self.assertIn("-vf", command)
+            self.assertEqual(command[command.index("-vf") + 1], "setpts=PTS-STARTPTS")
+            self.assertIn("-af", command)
+            self.assertEqual(command[command.index("-af") + 1], "asetpts=PTS-STARTPTS")
+            self.assertEqual(command[command.index("-c:a") + 1], "aac")
+            self.assertNotIn("copy", command)
 
     def test_opening_source_resets_trim_to_source_duration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
@@ -1532,6 +1850,44 @@ class GuiSmokeTests(unittest.TestCase):
             encode_source("blue")
             upscale_video.split_video_chunk(ffmpeg, source, target, 0, 4, 8.0, False, common.file_fingerprint(source))
             self.assertNotEqual(common.file_fingerprint(target)["sha256"], first["sha256"])
+
+    def test_upscale_chunk_split_uses_frame_index_trim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "src.mp4"
+            target = folder / "input_0000.mp4"
+            source.write_bytes(b"placeholder")
+            fingerprint = common.file_fingerprint(source)
+
+            with (
+                mock.patch.object(upscale_video, "split_matches_source", return_value=False),
+                mock.patch.object(upscale_video.subprocess, "run") as run,
+                mock.patch.object(upscale_video, "replace_unless_identical"),
+                mock.patch.object(upscale_video, "write_split_sidecar"),
+            ):
+                upscale_video.split_video_chunk("ffmpeg", source, target, 7, 19, 23.97602398, False, fingerprint)
+
+        command = run.call_args.args[0]
+        self.assertNotIn("-ss", command)
+        self.assertNotIn("-t", command)
+        self.assertEqual(command[command.index("-vf") + 1], "trim=start_frame=7:end_frame=19,setpts=N/(23.97602398*TB),fps=23.97602398,setsar=1")
+
+    def test_upscale_normalize_chunk_rebuilds_frame_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_text:
+            folder = Path(tmp_text)
+            source = folder / "raw.mp4"
+            target = folder / "final.mp4"
+            source.write_bytes(b"placeholder")
+
+            with (
+                mock.patch.object(upscale_video.subprocess, "run") as run,
+                mock.patch.object(upscale_video, "replace_with_retry"),
+            ):
+                upscale_video.normalize_chunk("ffmpeg", source, target, 1920, 1080, 4, 23.97602398, True)
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-vf") + 1], "trim=start_frame=4,setpts=N/(23.97602398*TB),fps=23.97602398,scale=1920:1080:flags=lanczos,setsar=1")
+        self.assertIn("-fps_mode", command)
 
     def test_write_manifest_details_skips_identical_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_text:
@@ -2101,6 +2457,35 @@ class GuiSmokeTests(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertIn("Run Recomposition first", message)
+
+    def test_upscale_stage_stops_before_comfy_on_unsupported_flashvsr_gpu(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "expand_outpaint": "false", "colorize": "false", "upscale": "true", "section_start": "0", "section_end": ""})
+
+        with (
+            mock.patch.object(server, "flashvsr_hardware_warning", return_value="Unsupported FlashVSR GPU"),
+            mock.patch.object(server, "ensure_comfy_available_for_stage") as ensure_comfy,
+        ):
+            ok, message = app.APP.run_stage("upscale")
+
+        self.assertFalse(ok)
+        self.assertEqual(message, "Unsupported FlashVSR GPU")
+        ensure_comfy.assert_not_called()
+
+    def test_upscale_preview_stops_on_unsupported_flashvsr_gpu(self) -> None:
+        app.APP.settings["global"].update({"source": "input/example.mp4", "expand_outpaint": "false", "colorize": "false", "upscale": "true", "section_start": "0", "section_end": ""})
+
+        with mock.patch.object(server, "flashvsr_hardware_warning", return_value="Unsupported FlashVSR GPU"):
+            ok, message = app.APP.run_upscale_preview()
+
+        self.assertFalse(ok)
+        self.assertEqual(message, "Unsupported FlashVSR GPU")
+
+    def test_flashvsr_hardware_warning_flags_pascal_gpu(self) -> None:
+        message = system_status.flashvsr_hardware_warning("NVIDIA GeForce GTX 1050", (6, 1))
+
+        self.assertIn("compute capability 6.1", message)
+        self.assertIn("FlashVSR upscaling requires NVIDIA compute capability 7.5+", message)
+        self.assertEqual(system_status.flashvsr_hardware_warning("NVIDIA GeForce RTX 2080", (7, 5)), "")
 
     def test_outpaint_hydration_does_not_pick_stale_newest_output_for_new_source(self) -> None:
         app.APP.settings["global"].update({"source": "input/new-source.mp4", "expand_outpaint": "true", "colorize": "false", "upscale": "false", "section_start": "0", "section_end": ""})

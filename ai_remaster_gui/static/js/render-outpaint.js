@@ -51,6 +51,8 @@ function outpaintChunkSummary(row) {
   const defaultFrames = Math.max(1, Math.min(Number(row.max_length_frames || projectFrames), projectFrames));
   const maxFrames = Math.max(frameCount, Number(row.max_length_frames || frameCount));
   const custom = !!row.custom_seconds;
+  const autoStartGuide = idx > 0 && String(row.auto_start_guide || '').toLowerCase() !== 'false';
+  const autoStartGuideDisabled = idx === 0 ? 'disabled' : '';
 
   return `
     <div>
@@ -64,6 +66,7 @@ function outpaintChunkSummary(row) {
       ${chunkOffsetControls(row)}
       <label>Seed</label>
       <input id="chunkSeed_${idx}" type="number" value="${esc(row.seed || '42')}">
+      <label><input id="chunkAutoStartGuide_${idx}" type="checkbox" ${autoStartGuide ? 'checked' : ''} ${autoStartGuideDisabled}> Use previous chunk as start guide</label>
       <div class="shot-tools">
         <button type="button" onclick="saveOutpaintChunk(${idx})">Save</button>
         <button type="button" data-outpaint-disable-running="true" onclick="regenerateOutpaintChunk(${idx})" ${state.running ? 'disabled' : ''}>Regenerate Chunk</button>

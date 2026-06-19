@@ -47,6 +47,7 @@ class Shot:
 @dataclass
 class ReferenceRow:
     index: int
+    start_frame: int
     end_frame: int
     selected_frame: int
     selected_time: float
@@ -299,15 +300,15 @@ def build_rows(args,source_path,info,shots):
             score=reuse_similarity_score(selected,csample)
             if score<best: best=score; reused=cpath
         if reused is not None and best<=args.existing_reuse_threshold: color=reused
-        rows.append(ReferenceRow(index,shot.end_frame,selected.frame,selected.time,src,color,reused if color==reused else None))
+        rows.append(ReferenceRow(index,shot.start_frame,shot.end_frame,selected.frame,selected.time,src,color,reused if color==reused else None))
         if args.limit is not None and len(rows)>=args.limit: break
     return rows
 
 def write_manifest(path,source_path,rows,info):
     path.parent.mkdir(parents=True,exist_ok=True); tmp=path.with_suffix(path.suffix+'.tmp')
     with tmp.open('w',encoding='utf-8',newline='') as h:
-        h.write(f'# source_video={root_relative(source_path)}\n'); w=csv.writer(h,lineterminator='\n'); w.writerow(['enabled','end','source_reference','color_reference','prompt','fade_to_next','crossfade_seconds'])
-        for row in rows: w.writerow(['true',format_time(min(row.end_frame/info.fps,info.duration)),root_relative(row.source_reference),root_relative(row.color_reference),'','false',''])
+        h.write(f'# source_video={root_relative(source_path)}\n'); w=csv.writer(h,lineterminator='\n'); w.writerow(['enabled','start_frame','end_frame','selected_frame','end','source_reference','color_reference','prompt','fade_to_next','crossfade_seconds'])
+        for row in rows: w.writerow(['true',row.start_frame,row.end_frame,row.selected_frame,format_time(min(row.end_frame/info.fps,info.duration)),root_relative(row.source_reference),root_relative(row.color_reference),'','false',''])
     tmp.replace(path)
 def source_signature(source_path,row,out_w=0,out_h=0): return {'version':2,'source_video':root_relative(source_path),'source_fingerprint':file_fingerprint(source_path),'selected_frame':row.selected_frame,'selected_time':row.selected_time,'output_width':out_w or 0,'output_height':out_h or 0,'generator':'generate_references.py'}
 def extract_frames(args,source_path,info,rows):

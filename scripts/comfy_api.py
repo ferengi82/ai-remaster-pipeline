@@ -57,7 +57,25 @@ def object_info(comfy_url: str) -> dict[str, Any]:
     return http_json('GET', f"{comfy_url.rstrip('/')}/object_info", timeout=30)
 
 
-def ensure_node_types(comfy_url: str, required: dict[str, str], context: str = "workflow") -> None:
+def package_defines_node(comfy_dir: Path | None, package: str, node_type: str) -> bool:
+    if comfy_dir is None:
+        return False
+    package_dir = comfy_dir / "custom_nodes" / package
+    if not package_dir.is_dir():
+        return False
+    needle = f'"{node_type}"'
+    alt_needle = f"name={needle}"
+    try:
+        for path in package_dir.rglob("*.py"):
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            if needle in text or alt_needle in text:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def ensure_node_types(comfy_url: str, required: dict[str, str], context: str = "workflow", comfy_dir: Path | None = None) -> None:
     available = object_info(comfy_url)
     missing = [node_type for node_type in required if node_type not in available]
     if not missing:
@@ -74,6 +92,23 @@ def ensure_node_types(comfy_url: str, required: dict[str, str], context: str = "
         "ComfyUI-MMAudio": "https://github.com/kijai/ComfyUI-MMAudio -> ComfyUI/custom_nodes/ComfyUI-MMAudio",
     }
     hints = "; ".join(install_hints.get(package, package) for package in sorted(set(required[node_type] for node_type in missing)))
+    stale_running_hints = [
+        node_type
+        for node_type in missing
+        if package_defines_node(comfy_dir, required[node_type], node_type)
+    ]
+    if stale_running_hints:
+        package_paths = "; ".join(
+            str(comfy_dir / "custom_nodes" / package)
+            for package in sorted({required[node_type] for node_type in stale_running_hints})
+            if comfy_dir is not None
+        )
+        raise RuntimeError(
+            f"ComfyUI is running at {comfy_url}, but the {context} cannot start because required node types are missing from the live server: {details}. "
+            f"The configured ComfyUI folder already contains those node definitions ({package_paths}), so that custom-node package either failed to import or the server at {comfy_url} is an older/stale ComfyUI process that was not restarted after install. "
+            f"Fully close every ComfyUI window/process using port 8188, then start ComfyUI from ARP again so it loads: {comfy_dir}. "
+            f"If it still fails after a restart, the ComfyUI console import error for the package(s) is the root cause to fix: {packages}."
+        )
     raise RuntimeError(
         f"ComfyUI is running at {comfy_url}, but the {context} cannot start because required node types are missing: {details}. "
         f"To fix: re-run install_windows.bat and choose the same ComfyUI directory when prompted. "

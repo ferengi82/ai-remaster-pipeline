@@ -1,3 +1,5 @@
+let recompMaskFrame = 0;
+
 function drawRecomp() {
   const st = stage('recomp');
   const s = settings('recomp');
@@ -250,9 +252,20 @@ function liveCompositeHtml(s) {
   return `
     <div class="live-composite">
       ${s.outpainted_video ? `<video id="recompVideo" class="sync-layer-video live-outpaint" src="${media(s.outpainted_video)}" controls preload="metadata"></video>` : ''}
-      ${s.source ? `<video class="sync-layer-video live-original" src="${media(s.source)}" muted preload="metadata" style="${originalLayerStyle(s)}"></video>` : ''}
+      ${originalLiveLayerHtml(s)}
       ${s.colorized_video ? `<video class="sync-layer-video live-color" src="${media(s.colorized_video)}" muted preload="metadata" style="${colorLayerStyle(s)}"></video>` : ''}
     </div>
+  `;
+}
+
+function originalLiveLayerHtml(s) {
+  if (!s.source) return '';
+  if (!sourceBlackTransparent()) {
+    return `<video class="sync-layer-video live-original" src="${media(s.source)}" muted preload="metadata" style="${originalLayerStyle(s)}"></video>`;
+  }
+  return `
+    <video class="sync-layer-video source-mask-video" src="${media(s.source)}" muted preload="metadata"></video>
+    <canvas class="live-original source-mask-canvas" style="${originalLayerStyle(s)}"></canvas>
   `;
 }
 
@@ -260,15 +273,27 @@ function layerPreviewHtml(s) {
   return `
     <div class="layer-preview-grid">
       <div><label>Outpainted</label>${layerVideo(s.outpainted_video, 'layer-outpaint')}</div>
-      <div><label>Original, feathered</label>${layerVideo(s.source, 'layer-original', originalFeatherStyle(s))}</div>
+      <div><label>Original, feathered</label>${originalLayerPreviewHtml(s)}</div>
       <div><label>Color</label>${layerVideo(s.colorized_video, 'layer-colour', colorLayerStyle(s))}</div>
     </div>
   `;
 }
 
+function originalLayerPreviewHtml(s) {
+  if (!s.source) return missingImage('Video not present');
+  if (!sourceBlackTransparent()) {
+    return layerVideo(s.source, 'layer-original', originalFeatherStyle(s));
+  }
+  return `<canvas class="layer-original source-mask-canvas" style="${originalFeatherStyle(s)}"></canvas>`;
+}
+
 function layerVideo(path, cls, style = '') {
   if (!path) return missingImage('Video not present');
   return `<video class="sync-layer-video ${cls}" src="${media(path)}" muted preload="metadata" style="${style}"></video>`;
+}
+
+function sourceBlackTransparent() {
+  return settings('outpaint').outpaint_all_black_regions === 'true';
 }
 
 function colorLayerStyle(s) {
@@ -324,6 +349,7 @@ function wireEditorVideo() {
   const scrubber = document.getElementById('recompScrub');
   const layers = [...document.querySelectorAll('.sync-layer-video')].filter(item => item !== mainVideo);
 
+  setupSourceBlackPreview();
   if (!mainVideo || !scrubber) return;
 
   const syncLayers = force => {
@@ -359,6 +385,77 @@ function wireEditorVideo() {
     });
   });
   updateRecompPreview();
+}
+
+function setupSourceBlackPreview() {
+  if (recompMaskFrame) {
+    cancelAnimationFrame(recompMaskFrame);
+    recompMaskFrame = 0;
+  }
+  if (!sourceBlackTransparent()) return;
+
+  const source = document.querySelector('.source-mask-video');
+  const canvases = [...document.querySelectorAll('.source-mask-canvas')];
+  if (!source || !canvases.length) return;
+
+  const draw = () => {
+    const activeSource = document.querySelector('.source-mask-video');
+    const activeCanvases = [...document.querySelectorAll('.source-mask-canvas')];
+    if (!activeSource || !activeCanvases.length) {
+      recompMaskFrame = 0;
+      return;
+    }
+    drawSourceBlackMask(activeSource, activeCanvases);
+    recompMaskFrame = requestAnimationFrame(draw);
+  };
+
+  source.addEventListener('loadeddata', () => drawSourceBlackMask(source, canvases), { once: true });
+  draw();
+}
+
+function drawSourceBlackMask(source, canvases) {
+  if (!source.videoWidth || !source.videoHeight || source.readyState < 2) return;
+  const threshold = 24;
+  const shrink = 2;
+  const scale = Math.min(1, 960 / source.videoWidth);
+  const width = Math.max(2, Math.round(source.videoWidth * scale));
+  const height = Math.max(2, Math.round(source.videoHeight * scale));
+  for (const canvas of canvases) {
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+    const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const data = image.data;
+    const blackAt = (x, y) => {
+      const clampedX = Math.max(0, Math.min(canvas.width - 1, x));
+      const clampedY = Math.max(0, Math.min(canvas.height - 1, y));
+      const index = (clampedY * canvas.width + clampedX) * 4;
+      return Math.max(data[index], data[index + 1], data[index + 2]) <= threshold;
+    };
+    for (let i = 0; i < data.length; i += 4) {
+      const pixel = i / 4;
+      const x = pixel % canvas.width;
+      const y = Math.floor(pixel / canvas.width);
+      if (
+        blackAt(x, y) ||
+        blackAt(x - shrink, y) ||
+        blackAt(x + shrink, y) ||
+        blackAt(x, y - shrink) ||
+        blackAt(x, y + shrink) ||
+        blackAt(x - shrink, y - shrink) ||
+        blackAt(x + shrink, y - shrink) ||
+        blackAt(x - shrink, y + shrink) ||
+        blackAt(x + shrink, y + shrink)
+      ) {
+        data[i + 3] = 0;
+      }
+    }
+    ctx.putImageData(image, 0, 0);
+  }
 }
 
 function scrubEditorVideo(value) {

@@ -2,14 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from . import state
 from .config import ASPECT_PREVIEW_DIR, FILE_PREVIEW_DIR, MEDIA_CLIP_DIR, PREVIEW_DIR, ROOT
 from .paths import rel, resolve
 from .config import DATA_ROOT
 from .config import CACHE_ROOT
-
-
-def bind_context(context: dict) -> None:
-    globals().update(context)
 
 
 def human_size(size: int) -> str:
@@ -152,7 +149,7 @@ def delete_cache_file(path_text: str) -> dict:
     except FileNotFoundError:
         return {"deleted": 0, "bytes": 0}
     clean_empty_cache_dirs(category)
-    APP.log.append(f"Deleted cached file: {rel(path)}")
+    state.APP.log.append(f"Deleted cached file: {rel(path)}")
     return {"deleted": 1, "bytes": size}
 
 def delete_cache_category(category_key: str) -> dict:
@@ -162,7 +159,7 @@ def delete_cache_category(category_key: str) -> dict:
             result = delete_cache_category(category["key"])
             total["deleted"] += result["deleted"]
             total["bytes"] += result["bytes"]
-        APP.log.append(f"Cleared all ARP cache categories: {total['deleted']} files, {human_size(total['bytes'])}.")
+        state.APP.log.append(f"Cleared all ARP cache categories: {total['deleted']} files, {human_size(total['bytes'])}.")
         return total
 
     category = next((item for item in cache_categories() if item["key"] == category_key), None)
@@ -179,13 +176,13 @@ def delete_cache_category(category_key: str) -> dict:
         except FileNotFoundError:
             continue
         except OSError as exc:
-            APP.log.append(f"Could not delete cached file {rel(path)}: {exc}")
+            state.APP.log.append(f"Could not delete cached file {rel(path)}: {exc}")
             continue
         deleted += 1
         bytes_deleted += size
 
     clean_empty_cache_dirs(category)
-    APP.log.append(f"Cleared {category['title']}: {deleted} files, {human_size(bytes_deleted)}.")
+    state.APP.log.append(f"Cleared {category['title']}: {deleted} files, {human_size(bytes_deleted)}.")
     return {"deleted": deleted, "bytes": bytes_deleted}
 
 def cache_category_for_path(path: Path) -> dict | None:

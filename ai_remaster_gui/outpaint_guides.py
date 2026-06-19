@@ -7,10 +7,21 @@ import sys
 import time
 from pathlib import Path
 
-from .config import IMAGE_EXTS, QWEN_IMAGE_EDIT_MODEL, ROOT, SCRIPTS, comfy_output_root_for
+from . import state
+from .config import (
+    FILE_PREVIEW_DIR,
+    IMAGE_EXTS,
+    QWEN_IMAGE_EDIT_MODEL,
+    ROOT,
+    SCRIPTS,
+    comfy_output_root_for,
+    current_config,
+)
+from .file_dialogs import browse_path
 from .manifests import read_outpaint_chunk_rows, write_outpaint_chunk_rows
-from .media import extract_video_frame_at
-from .paths import rel, resolve, resolve_video_source
+from .media import extract_video_frame_at, pipeline_source_text
+from .paths import rel, resolve
+from .runtime_settings import qwen_masked_workflow_for
 from .sam_masks import sam2_mask_for_image
 from .config import DATA_ROOT
 
@@ -18,9 +29,25 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 from guide_frame_utils import guide_output_size_for_prepared, save_edge_mask_for_image  # noqa: E402
 
+# These few names live in server.py (a constant plus helpers wired into its outpaint internals);
+# importing server here would be circular (see state.py), so server.py injects them at startup via
+# bind_context. Declared here so the names resolve statically.
+DEFAULT_ANCHOR_PROMPT = ""
+ensure_outpaint_prepared_canvas = None
+outpaint_chunks_state = None
+remove_cached_file = None
+
+_SERVER_OUTPAINT_OPS = (
+    "DEFAULT_ANCHOR_PROMPT",
+    "ensure_outpaint_prepared_canvas",
+    "outpaint_chunks_state",
+    "remove_cached_file",
+)
+
 
 def bind_context(context: dict) -> None:
-    globals().update(context)
+    """Wire in the server.py-defined outpaint constant/helpers this module calls (see above)."""
+    globals().update({name: context[name] for name in _SERVER_OUTPAINT_OPS})
 
 
 def chunk_frame_preview(source: Path, seconds: float, suffix: str) -> str:
@@ -110,9 +137,9 @@ def _build_guide_frames_view(
 
 def guide_frame_generation_command(chunk_index: int, guide_index: int, frame_idx: int, prompt: str) -> tuple[list[str], str, Path, float]:
     """Build the Qwen generation command for any guide frame position."""
-    state = outpaint_chunks_state(APP.settings)
-    rows = state.get("rows", [])
-    manifest_text = state.get("manifest", "")
+    chunks_state = outpaint_chunks_state(state.APP.settings)
+    rows = chunks_state.get("rows", [])
+    manifest_text = chunks_state.get("manifest", "")
     if not manifest_text:
         raise RuntimeError("No outpaint chunk manifest is available yet.")
     if chunk_index < 0 or chunk_index >= len(rows):
@@ -122,10 +149,10 @@ def guide_frame_generation_command(chunk_index: int, guide_index: int, frame_idx
     fps = float(row.get("fps", 24) or 24)
     source_seconds = _guide_source_seconds(row, frame_idx, fps)
 
-    source_text = pipeline_source_text(APP.settings)
+    source_text = pipeline_source_text(state.APP.settings)
     if not source_text:
         raise RuntimeError("No source material is selected.")
-    range_source = ensure_outpaint_prepared_canvas(source_text, APP.settings.get("outpaint", {}))
+    range_source = ensure_outpaint_prepared_canvas(source_text, state.APP.settings.get("outpaint", {}))
     cache_key = f"gf_qwen_{int(source_seconds * 1000):010d}"
     preview_rel = chunk_frame_preview(range_source, source_seconds, cache_key)
     source_img = resolve(preview_rel) if preview_rel else Path("")
@@ -249,7 +276,7 @@ def save_qwen_input_copy(source: Path, target: Path) -> Path:
     return target
 
 def auto_masked_guide_command(source: Path, output: Path, prompt: str, mask: Path) -> list[str]:
-    values = APP.settings.get("references", {})
+    values = state.APP.settings.get("references", {})
     config = current_config()
     workflow = qwen_masked_workflow_for(values, config)
     if not workflow:
@@ -279,9 +306,9 @@ def auto_masked_guide_command(source: Path, output: Path, prompt: str, mask: Pat
     return cmd
 
 def outpaint_guide_generation_command(index: int, prompt: str) -> tuple[list[str], str, Path]:
-    state = outpaint_chunks_state(APP.settings)
-    rows = state.get("rows", [])
-    manifest_text = state.get("manifest", "")
+    chunks_state = outpaint_chunks_state(state.APP.settings)
+    rows = chunks_state.get("rows", [])
+    manifest_text = chunks_state.get("manifest", "")
     if not manifest_text:
         raise RuntimeError("No outpaint chunk manifest is available yet.")
     if index < 0 or index >= len(rows):
@@ -291,10 +318,10 @@ def outpaint_guide_generation_command(index: int, prompt: str) -> tuple[list[str
     fps = float(row.get("fps", 24) or 24)
     start_seconds = float(row.get("start", 0.0))
     guide_source_seconds = start_seconds
-    source_text = pipeline_source_text(APP.settings)
+    source_text = pipeline_source_text(state.APP.settings)
     if not source_text:
         raise RuntimeError("No source material is selected.")
-    range_source = ensure_outpaint_prepared_canvas(source_text, APP.settings.get("outpaint", {}))
+    range_source = ensure_outpaint_prepared_canvas(source_text, state.APP.settings.get("outpaint", {}))
     preview_rel = chunk_frame_preview(range_source, guide_source_seconds, "source_guide_qwen")
     source = resolve(preview_rel) if preview_rel else Path("")
     if not source.is_file():
@@ -319,9 +346,9 @@ def outpaint_guide_generation_command(index: int, prompt: str) -> tuple[list[str
     return cmd, rel(output), resolve(range_source), guide_source_seconds
 
 def outpaint_end_guide_generation_command(index: int, prompt: str) -> tuple[list[str], str, Path, float]:
-    state = outpaint_chunks_state(APP.settings)
-    rows = state.get("rows", [])
-    manifest_text = state.get("manifest", "")
+    chunks_state = outpaint_chunks_state(state.APP.settings)
+    rows = chunks_state.get("rows", [])
+    manifest_text = chunks_state.get("manifest", "")
     if not manifest_text:
         raise RuntimeError("No outpaint chunk manifest is available yet.")
     if index < 0 or index >= len(rows):
@@ -332,10 +359,10 @@ def outpaint_end_guide_generation_command(index: int, prompt: str) -> tuple[list
     end_seconds = float(row.get("end", 0.0))
     # Use the last meaningful frame (end - 1/fps) as the Qwen source for the end guide.
     guide_source_seconds = max(float(row.get("start", 0.0)), end_seconds - (1.0 / max(1.0, fps)))
-    source_text = pipeline_source_text(APP.settings)
+    source_text = pipeline_source_text(state.APP.settings)
     if not source_text:
         raise RuntimeError("No source material is selected.")
-    range_source = ensure_outpaint_prepared_canvas(source_text, APP.settings.get("outpaint", {}))
+    range_source = ensure_outpaint_prepared_canvas(source_text, state.APP.settings.get("outpaint", {}))
     preview_rel = chunk_frame_preview(range_source, guide_source_seconds, "source_guide_end_qwen")
     source = resolve(preview_rel) if preview_rel else Path("")
     if not source.is_file():
@@ -361,8 +388,8 @@ def outpaint_end_guide_generation_command(index: int, prompt: str) -> tuple[list
 
 
 def _get_guide_manifest() -> tuple[Path, dict[int, dict[str, str]], str]:
-    state = outpaint_chunks_state(APP.settings)
-    manifest_text = state.get("manifest", "")
+    chunks_state = outpaint_chunks_state(state.APP.settings)
+    manifest_text = chunks_state.get("manifest", "")
     if not manifest_text:
         raise RuntimeError("No outpaint chunk manifest is available yet.")
     manifest = resolve(str(manifest_text))
@@ -376,7 +403,7 @@ def add_guide_frame(chunk_index: int) -> dict:
     frames = _parse_guide_frames(rows[chunk_index])
     frames.append({"frame_idx": 0, "strength": 0.7, "image": ""})
     _save_guide_frames(manifest, chunk_index, frames)
-    APP.log.append(f"Added guide frame to chunk {chunk_index + 1} (total: {len(frames)})")
+    state.APP.log.append(f"Added guide frame to chunk {chunk_index + 1} (total: {len(frames)})")
     return {"guide_index": len(frames) - 1}
 
 def remove_guide_frame(chunk_index: int, guide_index: int) -> dict:
@@ -390,7 +417,7 @@ def remove_guide_frame(chunk_index: int, guide_index: int) -> dict:
     if removed.get("image"):
         remove_cached_file(resolve(removed["image"]))
     _save_guide_frames(manifest, chunk_index, frames)
-    APP.log.append(f"Removed guide frame {guide_index} from chunk {chunk_index + 1}")
+    state.APP.log.append(f"Removed guide frame {guide_index} from chunk {chunk_index + 1}")
     return {"removed": guide_index}
 
 def save_guide_frame(chunk_index: int, guide_index: int, frame_idx: int, strength: float) -> dict:
@@ -403,7 +430,7 @@ def save_guide_frame(chunk_index: int, guide_index: int, frame_idx: int, strengt
     frames[guide_index]["frame_idx"] = int(frame_idx)
     frames[guide_index]["strength"] = round(max(0.0, min(1.0, float(strength))), 3)
     _save_guide_frames(manifest, chunk_index, frames)
-    APP.log.append(f"Saved guide frame {guide_index} for chunk {chunk_index + 1}: frame_idx={frame_idx}, strength={strength:.2f}")
+    state.APP.log.append(f"Saved guide frame {guide_index} for chunk {chunk_index + 1}: frame_idx={frame_idx}, strength={strength:.2f}")
     return {"frame_idx": frame_idx, "strength": frames[guide_index]["strength"]}
 
 def upload_guide_frame_image(chunk_index: int, guide_index: int) -> dict:
@@ -427,7 +454,7 @@ def upload_guide_frame_image(chunk_index: int, guide_index: int) -> dict:
     frames[guide_index]["image"] = rel(target)
     frames[guide_index].pop("seed", None)
     _save_guide_frames(manifest, chunk_index, frames)
-    APP.log.append(f"Uploaded guide frame {guide_index} for chunk {chunk_index + 1}: {rel(target)}")
+    state.APP.log.append(f"Uploaded guide frame {guide_index} for chunk {chunk_index + 1}: {rel(target)}")
     return {"selected": selected, "image": rel(target)}
 
 def clear_guide_frame_image(chunk_index: int, guide_index: int) -> dict:
@@ -442,7 +469,7 @@ def clear_guide_frame_image(chunk_index: int, guide_index: int) -> dict:
         remove_cached_file(resolve(current))
     frames[guide_index]["image"] = ""
     _save_guide_frames(manifest, chunk_index, frames)
-    APP.log.append(f"Cleared guide frame {guide_index} image for chunk {chunk_index + 1}")
+    state.APP.log.append(f"Cleared guide frame {guide_index} image for chunk {chunk_index + 1}")
     return {"image": ""}
 
 def _guide_edit_dir(manifest: Path, chunk_index: int, guide_index: int) -> Path:
@@ -502,17 +529,17 @@ def _guide_editor_source(chunk_index: int, guide_index: int, frames: list[dict])
     current = frames[guide_index].get("image", "")
     if current and resolve(current).is_file():
         return current, None, None
-    state = outpaint_chunks_state(APP.settings)
-    rows = state.get("rows", [])
+    chunks_state = outpaint_chunks_state(state.APP.settings)
+    rows = chunks_state.get("rows", [])
     if chunk_index < 0 or chunk_index >= len(rows):
         raise IndexError(f"Outpaint chunk not found: {chunk_index + 1}")
     row = rows[chunk_index]
     fps = float(row.get("fps", 24) or 24)
     source_seconds = _guide_source_seconds(row, int(frames[guide_index].get("frame_idx", 0)), fps)
-    source_text = pipeline_source_text(APP.settings)
+    source_text = pipeline_source_text(state.APP.settings)
     if not source_text:
         raise RuntimeError("No source material is selected.")
-    prepared = ensure_outpaint_prepared_canvas(source_text, APP.settings.get("outpaint", {}))
+    prepared = ensure_outpaint_prepared_canvas(source_text, state.APP.settings.get("outpaint", {}))
     preview_rel = chunk_frame_preview(prepared, source_seconds, f"guide_edit_{chunk_index}_{guide_index}")
     if not preview_rel or not resolve(preview_rel).is_file():
         raise FileNotFoundError("Could not prepare a guide image for editing.")
@@ -533,7 +560,7 @@ def guide_edit_preview_command(chunk_index: int, guide_index: int, instruction: 
         mask_path = _guide_edit_dir(manifest, chunk_index, guide_index) / f"mask_edge_{time.strftime('%Y%m%d_%H%M%S')}.png"
         mask = rel(save_edge_mask_for_image(source, mask_path))
     prompt = _guide_edit_prompt(instruction, sampled_color)
-    values = APP.settings.get("references", {})
+    values = state.APP.settings.get("references", {})
     config = current_config()
     comfy_dir = config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))
     comfy_url = values.get("comfy_url") or config.get("comfy_url", "http://127.0.0.1:8188")
@@ -609,7 +636,7 @@ def accept_guide_edit(chunk_index: int, guide_index: int, preview_path: str) -> 
     frames[guide_index]["image"] = rel(preview)
     frames[guide_index].pop("seed", None)
     _save_guide_frames(manifest, chunk_index, frames)
-    APP.log.append(f"Accepted edited guide frame {guide_index + 1} for chunk {chunk_index + 1}: {rel(preview)}")
+    state.APP.log.append(f"Accepted edited guide frame {guide_index + 1} for chunk {chunk_index + 1}: {rel(preview)}")
     return {"image": rel(preview), "previous": previous}
 
 def save_guide_paint(chunk_index: int, guide_index: int, image_data: str) -> dict:
@@ -659,5 +686,5 @@ def revert_guide_edit(chunk_index: int, guide_index: int) -> dict:
     frames[guide_index]["image_previous"] = current
     frames[guide_index]["image"] = previous
     _save_guide_frames(manifest, chunk_index, frames)
-    APP.log.append(f"Reverted guide frame {guide_index + 1} for chunk {chunk_index + 1}: {previous}")
+    state.APP.log.append(f"Reverted guide frame {guide_index + 1} for chunk {chunk_index + 1}: {previous}")
     return {"image": previous, "previous": current}

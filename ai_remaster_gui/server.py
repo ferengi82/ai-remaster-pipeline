@@ -28,7 +28,9 @@ from .config import (
     STATIC_DIR,
     TEXT_EXTS,
     VIDEO_EXTS,
+    comfy_dir_for,
     comfy_output_root_for,
+    comfy_url_for,
     current_config,
 )
 from .manifests import (
@@ -41,7 +43,8 @@ from .manifests import (
     write_outpaint_chunk_rows,
 )
 from .models import COLORIZE_STAGE_KEYS, STAGES, Stage, output_stage
-from .paths import even_int, newest, rel, resolve, resolve_video_source, safe_stem
+from .paths import even_int, format_timecode, newest, rel, resolve, resolve_served, resolve_video_source, safe_stem
+from .naming import manifest_for_outpainted
 from .project_io import (
     last_browse_dir,
     project_default_path,
@@ -51,7 +54,6 @@ from .project_io import (
     source_analysis_key,
     source_signature,
     write_project_file,
-    bind_context as bind_project_context,
 )
 from .process_utils import (
     count_lines_matching,
@@ -73,7 +75,6 @@ from .references import (
     delete_color_reference,
     extract_reference_frame,
     file_mtime,
-    format_timecode,
     install_custom_color_reference,
     manifest_fps,
     merge_manifest_shots,
@@ -96,7 +97,6 @@ from .references import (
     shot_views,
     update_shot_boundary,
     update_shot_fade,
-    bind_context as bind_references_context,
 )
 from .file_dialogs import (
     applescript_quote,
@@ -109,7 +109,6 @@ from .file_dialogs import (
     browse_path_zenity,
     parse_duration,
     remember_browse_dir,
-    bind_context as bind_file_dialogs_context,
 )
 from .lifecycle import (
     create_server,
@@ -118,7 +117,6 @@ from .lifecycle import (
     request_quit,
     start_comfy_if_needed,
     stop_started_comfy,
-    bind_context as bind_lifecycle_context,
 )
 from .outpaint_guides import (
     _build_guide_frames_view,
@@ -145,9 +143,9 @@ from .outpaint_guides import (
     upload_guide_frame_image,
     bind_context as bind_outpaint_guides_context,
 )
-from .cache import cache_state, delete_cache_category, delete_cache_file, human_size, bind_context as bind_cache_context
+from .cache import cache_state, delete_cache_category, delete_cache_file, human_size
 from .runtime_settings import APP_VERSION, default_qwen_workflow, load_settings, qwen_masked_workflow_for, qwen_workflow_for
-from .system_status import system_status
+from .system_status import flashvsr_hardware_warning, system_status
 from .media import (
     aspect_preview,
     aspect_preview_at,
@@ -192,7 +190,6 @@ from .media import (
     video_dimensions,
     video_metrics,
     media_clip_path,
-    bind_context as bind_media_context,
 )
 from .config import DATA_ROOT
 from .config import CACHE_ROOT
@@ -207,10 +204,35 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 import artifact_ids as aid  # noqa: E402
 
+from . import state  # shared singleton registry; sibling modules read state.APP
+
+
+def is_true(values: dict[str, str], key: str, default: str = "false") -> bool:
+    """Interpret a stored '"true"/"false"' setting string as a bool."""
+    return values.get(key, default) == "true"
+
+
+def cli_flag_name(key: str) -> str:
+    """Settings key -> CLI flag name, e.g. 'crop_left' -> '--crop-left'."""
+    return "--" + key.replace("_", "-")
+
+
+def add_value_args(cmd: list[str], values: dict[str, str], keys: tuple[str, ...], default: str = "") -> None:
+    """Append a `--kebab-key <value>` pair for each settings key, values passed through verbatim."""
+    for key in keys:
+        cmd.extend([cli_flag_name(key), values.get(key, default)])
+
+
+def add_bool_flags(cmd: list[str], values: dict[str, str], keys: tuple[str, ...], default: str = "false") -> None:
+    """Append `--kebab-key` when a boolean setting is on, else its `--no-kebab-key` form."""
+    for key in keys:
+        flag = cli_flag_name(key)
+        cmd.append(flag if is_true(values, key, default) else "--no-" + flag[2:])
+
 
 def stable_audio_checkpoint_path(checkpoint: str) -> Path:
     config = current_config()
-    comfy_dir = Path(config.get("comfy_dir", str(ROOT / "tools" / "comfyui")))
+    comfy_dir = Path(comfy_dir_for(config))
     return comfy_dir / "models" / "checkpoints" / checkpoint
 
 
@@ -308,15 +330,7 @@ def source_defaults_for(source: Path, monochrome: bool | None = None, info: dict
     return source_workflow_defaults(metadata, monochrome)
 
 
-
-
 DEFAULT_ANCHOR_PROMPT = "Replace the black bars."
-
-
-
-
-
-
 
 
 class PipelineApp:
@@ -348,16 +362,16 @@ class PipelineApp:
             self.hydrate_stage_inputs("global")
 
     def colorize_enabled(self) -> bool:
-        return self.settings.get("global", {}).get("colorize", "true") == "true"
+        return is_true(self.settings.get("global", {}), "colorize", "true")
 
     def outpaint_enabled(self) -> bool:
-        return self.settings.get("global", {}).get("expand_outpaint", "true") == "true"
+        return is_true(self.settings.get("global", {}), "expand_outpaint", "true")
 
     def upscale_enabled(self) -> bool:
-        return self.settings.get("global", {}).get("upscale", "false") == "true"
+        return is_true(self.settings.get("global", {}), "upscale")
 
     def soundtrack_enabled(self) -> bool:
-        return self.settings.get("global", {}).get("add_soundtrack", "false") == "true"
+        return is_true(self.settings.get("global", {}), "add_soundtrack")
 
     def active_stages(self) -> tuple[Stage, ...]:
         by_key = {stage.key: stage for stage in STAGES}
@@ -1016,174 +1030,203 @@ class PipelineApp:
     def existing_outputs(self, stage_key: str) -> list[str]:
         return [path for path in self.expected_outputs(stage_key) if path and resolve(path).exists()]
 
+    # Per-stage command builders. command_for() dispatches here by stage key; each builder returns
+    # the full `python -u <script> …` argv for its stage (or [] to signal "nothing runnable yet").
+    # Shared --force/--dry-run handling lives in command_for so it stays in one place.
+    def _stage_command_builders(self) -> dict:
+        return {
+            "outpaint": self._outpaint_command,
+            "shots": self._shots_command,
+            "references": self._references_command,
+            "colour": self._colour_command,
+            "recomp": self._recomp_command,
+            "audio": self._audio_command,
+            "upscale": self._upscale_stage_command,
+        }
+
     def command_for(self, stage_key: str) -> list[str]:
         values = self.settings[stage_key]
         config = current_config()
-        py = sys.executable
-        cmd = [py, "-u"]
-        add = cmd.extend
-        if stage_key == "outpaint":
-            cmd.append(str(SCRIPTS / "outpaint_video.py"))
-            add(["--source", pipeline_source_text(self.settings)])
-            add(["--target-aspect", values.get("target_aspect", "16:9")])
-            add(["--target-height", str(resolved_outpaint_height(pipeline_source_text(self.settings), values.get("target_height", "720")))])
-            add(["--chunk-seconds", values.get("chunk_seconds", "20")])
-            add(["--overlap-frames", values.get("overlap_frames", "8")])
-            add(["--prompt", values.get("prompt") or OUTPAINT_PROMPT])
-            if values.get("negative_prompt"):
-                add(["--negative-prompt", values.get("negative_prompt", "")])
-            if values.get("guide_strength"):
-                add(["--guide-strength", values.get("guide_strength", "0.7")])
-            if values.get("guide_end_strength"):
-                add(["--guide-end-strength", values.get("guide_end_strength", "1.0")])
-            if values.get("outpaint_all_black_regions", "false") == "true":
-                add(["--outpaint-all-black-regions"])
-            if values.get("seed_qwen_guides", "false") == "true":
-                ref = self.settings.get("references", {})
-                comfy_dir = config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))
-                qwen_workflow = qwen_workflow_for(ref, config) or ref.get("workflow", "")
-                qwen_masked_workflow = qwen_masked_workflow_for(ref, config) or ref.get("masked_workflow", "")
-                add(["--seed-qwen-guides"])
-                if qwen_workflow:
-                    add(["--qwen-workflow", qwen_workflow])
-                if qwen_masked_workflow:
-                    add(["--qwen-masked-workflow", qwen_masked_workflow])
-                add(["--qwen-model-backend", ref.get("model_backend", "gguf")])
-                add(["--qwen-gguf-model", ref.get("gguf_model", QWEN_IMAGE_EDIT_MODEL)])
-                add(["--qwen-prompt", DEFAULT_ANCHOR_PROMPT])
-                add(["--qwen-load-image-node-id", ref.get("load_image_node_id", "auto")])
-                add(["--qwen-save-node-id", ref.get("save_node_id", "auto")])
-                add(["--comfy-output-root", comfy_output_root_for(config)])
-                shot_values = self.settings.get("shots", {})
-                add(["--seed-sample-seconds", shot_values.get("sample_seconds", "0") or "0"])
-                add(["--seed-shot-threshold", shot_values.get("shot_threshold", "0.075") or "0.075"])
-                add(["--seed-min-shot-seconds", shot_values.get("min_shot_seconds", "1.0") or "1.0"])
-            manifest = outpaint_chunk_manifest_for(pipeline_source_text(self.settings), values)
-            if manifest:
-                add(["--chunk-manifest", manifest])
-            for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"):
-                add([f"--{key.replace('_', '-')}", values.get(key, "0")])
-            add(["--comfy-dir", config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))])
-            add(["--comfy-url", config.get("comfy_url", "http://127.0.0.1:8188")])
-        elif stage_key == "shots":
-            cmd.append(str(SCRIPTS / "generate_references.py"))
-            add(["--source-video", values.get("outpainted_video", "")])
-            manifest = manifest_for_outpainted(values.get("outpainted_video", ""))
-            if manifest:
-                add(["--output-manifest", manifest])
-            for key in ("sample_seconds", "shot_threshold", "min_shot_seconds"):
-                add([f"--{key.replace('_', '-')}", values.get(key, "")])
-            if values.get("limit"):
-                add(["--limit", values["limit"]])
-            # Extract reference frames at model-safe dimensions (matching the prepared canvas)
-            # so thumbnails are consistent with what LTX works with.
-            outpaint_values = self.settings.get("outpaint", {})
-            source_text = pipeline_source_text(self.settings)
-            aspect = outpaint_values.get("target_aspect", "16:9")
-            height_text = outpaint_values.get("target_height", "720")
-            ref_w, ref_h = outpaint_work_size_for_source(source_text, aspect, height_text)
-            add(["--frame-width", str(ref_w), "--frame-height", str(ref_h)])
-        elif stage_key == "references":
-            if values.get("method", "qwen") == "openai":
-                cmd.append(str(SCRIPTS / "openai_generate_reference.py"))
-                add(["--manifest", values.get("manifest", ""), "--api-key", values.get("openai_api_key", "")])
-                add(["--model", values.get("openai_image_model", "gpt-image-2") or "gpt-image-2"])
-                add(["--prompt", values.get("prompt", ""), "--prompt-suffix", values.get("prompt_suffix", "")])
-                add(["--size", values.get("openai_image_size", "auto"), "--quality", values.get("openai_image_quality", "auto")])
-                if values.get("openai_send_references", "false") == "true":
-                    add(["--reference-count", "3"])
-            else:
-                cmd.append(str(SCRIPTS / "qwen_colorize_references.py"))
-                workflow = qwen_workflow_for(values, config)
-                comfy_url = values.get("comfy_url") or config.get("comfy_url", "http://127.0.0.1:8188")
-                comfy_dir = config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))
-                comfy_output = comfy_output_root_for(config)
-                add(["--manifest", values.get("manifest", ""), "--workflow", workflow, "--comfy-url", comfy_url])
-                add(["--comfy-dir", comfy_dir, "--comfy-output-root", comfy_output])
-                add(["--model-backend", values.get("model_backend", "gguf"), "--gguf-model", values.get("gguf_model", QWEN_IMAGE_EDIT_MODEL)])
-                add(["--prompt", values.get("prompt", ""), "--prompt-suffix", values.get("prompt_suffix", ""), "--load-image-node-id", values.get("load_image_node_id", "auto"), "--save-node-id", values.get("save_node_id", "auto")])
-                if values.get("prompt_node_id"):
-                    add(["--prompt-node-id", values["prompt_node_id"]])
-            if values.get("limit"):
-                add(["--limit", values["limit"]])
-        elif stage_key == "colour":
-            cmd.append(str(SCRIPTS / "colorize_video.py"))
-            add(["--manifest", values.get("manifest", "")])
-            method = values.get("method", "deepexemplar")
-            add(["--method", method])
-            output = colorized_output_for_manifest(values.get("manifest", ""), method)
-            if output:
-                add(["--output", output])
-            add(["--comfy-dir", config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))])
-            add(["--comfy-url", config.get("comfy_url", "http://127.0.0.1:8188")])
-            add(["--comfy-output-root", str(Path(config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))) / "output")])
-            add(["--crf", values.get("crf", "18")])
-            add(["--colormnet-memory-mode", values.get("colormnet_memory_mode", "balanced")])
-            add(["--colormnet-feature-encoder", values.get("colormnet_feature_encoder", "resnet50")])
-            if values.get("colormnet_text_guidance"):
-                add(["--colormnet-text-guidance", values["colormnet_text_guidance"]])
-            for key in ("frame_propagate", "use_half_resolution", "use_torch_compile", "use_sage_attention"):
-                flag = "--" + key.replace("_", "-")
-                add([flag if values.get(key, "false") == "true" else "--no-" + flag[2:]])
-        elif stage_key == "recomp":
-            cmd.append(str(SCRIPTS / "final_composite.py"))
-            output = values.get("output") or recomposition_output_for(values.get("outpainted_video", ""))
-            add(["--outpainted", values.get("outpainted_video", ""), "--source", values.get("source", ""), "--output", output])
-            if self.colorize_enabled() and values.get("colorized_video"):
-                add(["--colorized", values["colorized_video"]])
-            add(["--feather-pixels", values.get("feather_pixels", "80"), "--saturation", values.get("saturation", "0.82"), "--temperature", values.get("temperature", "-0.015"), "--color-opacity", values.get("color_opacity", "1.0"), "--encoder", values.get("encoder", "h264")])
-            outpaint_values = self.settings.get("outpaint", {})
-            for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"):
-                add([f"--{key.replace('_', '-')}", outpaint_values.get(key, "0")])
-            # Pass delivery dimensions so final_composite upscales from the model-safe LTX output
-            # (e.g. 704p) back to the user's intended resolution (e.g. 720p).
-            source_text = pipeline_source_text(self.settings)
-            aspect = outpaint_values.get("target_aspect", "16:9")
-            height_text = outpaint_values.get("target_height", "720")
-            delivery_w, delivery_h = outpaint_size_for_source(source_text, aspect, height_text)
-            add(["--output-width", str(delivery_w), "--output-height", str(delivery_h)])
-        elif stage_key == "audio":
-            cmd.append(str(SCRIPTS / "create_audio_track.py"))
-            source = self.soundtrack_source_for() or values.get("input_video", "")
-            output = soundtrack_output_for(source, values)
-            add(["--input", source, "--output", output])
-            add(["--comfy-dir", config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))])
-            add(["--comfy-url", config.get("comfy_url", "http://127.0.0.1:8188")])
-            add(["--comfy-output-root", str(Path(config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))) / "output")])
-            if values.get("create_music", "true") == "true":
-                add(["--music"])
-            if values.get("create_sfx", "true") == "true":
-                add(["--sfx"])
-            if values.get("music_prompt"):
-                add(["--music-prompt", values.get("music_prompt", "")])
-            if values.get("music_negative_prompt"):
-                add(["--music-negative", values.get("music_negative_prompt", "")])
-            add(["--music-cue-seconds", values.get("music_cue_seconds", "30")])
-            if values.get("music_checkpoint"):
-                add(["--music-checkpoint", values.get("music_checkpoint", "")])
-            if values.get("sfx_prompt"):
-                add(["--sfx-prompt", values.get("sfx_prompt", "")])
-            if values.get("sfx_negative_prompt"):
-                add(["--sfx-negative", values.get("sfx_negative_prompt", "")])
-            add(["--sfx-chunk-seconds", values.get("sfx_chunk_seconds", "8")])
-            add(["--sfx-short-side", values.get("sfx_short_side", "384")])
-            add(["--music-gain-db", values.get("music_gain_db", "-9")])
-            add(["--sfx-gain-db", values.get("sfx_gain_db", "0")])
-            add(["--seed", values.get("seed", "42")])
-            if values.get("caption_node"):
-                add(["--caption-node", values.get("caption_node", "")])
-            add(["--ollama-vision-model", values.get("ollama_vision_model", "auto")])
-        elif stage_key == "upscale":
-            source = self.upscale_input_for() or values.get("input_video")
-            output = upscale_output_for(source, values) or values.get("output")
-            if not source or not output:
-                return []
-            cmd = self.upscale_command(values, source, output)
-        if values.get("force") == "true":
+        builder = self._stage_command_builders().get(stage_key)
+        cmd = builder(config, values) if builder else [sys.executable, "-u"]
+        if not cmd:
+            return []
+        if is_true(values, "force"):
             cmd.append("--force")
-        if values.get("dry_run") == "true":
+        if is_true(values, "dry_run"):
             cmd.append("--dry-run")
         return [part for part in cmd if part != ""]
+
+    def _outpaint_command(self, config: dict[str, str], values: dict[str, str]) -> list[str]:
+        cmd = [sys.executable, "-u", str(SCRIPTS / "outpaint_video.py")]
+        add = cmd.extend
+        add(["--source", pipeline_source_text(self.settings)])
+        add(["--target-aspect", values.get("target_aspect", "16:9")])
+        add(["--target-height", str(resolved_outpaint_height(pipeline_source_text(self.settings), values.get("target_height", "720")))])
+        add(["--chunk-seconds", values.get("chunk_seconds", "20")])
+        add(["--overlap-frames", values.get("overlap_frames", "8")])
+        add(["--prompt", values.get("prompt") or OUTPAINT_PROMPT])
+        if values.get("negative_prompt"):
+            add(["--negative-prompt", values.get("negative_prompt", "")])
+        if values.get("guide_strength"):
+            add(["--guide-strength", values.get("guide_strength", "0.7")])
+        if values.get("guide_end_strength"):
+            add(["--guide-end-strength", values.get("guide_end_strength", "1.0")])
+        if is_true(values, "outpaint_all_black_regions"):
+            add(["--outpaint-all-black-regions"])
+        if is_true(values, "seed_qwen_guides"):
+            ref = self.settings.get("references", {})
+            qwen_workflow = qwen_workflow_for(ref, config) or ref.get("workflow", "")
+            qwen_masked_workflow = qwen_masked_workflow_for(ref, config) or ref.get("masked_workflow", "")
+            add(["--seed-qwen-guides"])
+            if qwen_workflow:
+                add(["--qwen-workflow", qwen_workflow])
+            if qwen_masked_workflow:
+                add(["--qwen-masked-workflow", qwen_masked_workflow])
+            add(["--qwen-model-backend", ref.get("model_backend", "gguf")])
+            add(["--qwen-gguf-model", ref.get("gguf_model", QWEN_IMAGE_EDIT_MODEL)])
+            add(["--qwen-prompt", DEFAULT_ANCHOR_PROMPT])
+            add(["--qwen-load-image-node-id", ref.get("load_image_node_id", "auto")])
+            add(["--qwen-save-node-id", ref.get("save_node_id", "auto")])
+            add(["--comfy-output-root", comfy_output_root_for(config)])
+            shot_values = self.settings.get("shots", {})
+            add(["--seed-sample-seconds", shot_values.get("sample_seconds", "0") or "0"])
+            add(["--seed-shot-threshold", shot_values.get("shot_threshold", "0.075") or "0.075"])
+            add(["--seed-min-shot-seconds", shot_values.get("min_shot_seconds", "1.0") or "1.0"])
+        manifest = outpaint_chunk_manifest_for(pipeline_source_text(self.settings), values)
+        if manifest:
+            add(["--chunk-manifest", manifest])
+        add_value_args(cmd, values, ("crop_left", "crop_right", "crop_top", "crop_bottom"), "0")
+        add(["--comfy-dir", comfy_dir_for(config)])
+        add(["--comfy-url", comfy_url_for(config)])
+        return cmd
+
+    def _shots_command(self, config: dict[str, str], values: dict[str, str]) -> list[str]:
+        cmd = [sys.executable, "-u", str(SCRIPTS / "generate_references.py")]
+        add = cmd.extend
+        add(["--source-video", values.get("outpainted_video", "")])
+        manifest = manifest_for_outpainted(values.get("outpainted_video", ""))
+        if manifest:
+            add(["--output-manifest", manifest])
+        add_value_args(cmd, values, ("sample_seconds", "shot_threshold", "min_shot_seconds"))
+        if values.get("limit"):
+            add(["--limit", values["limit"]])
+        # Extract reference frames at model-safe dimensions (matching the prepared canvas)
+        # so thumbnails are consistent with what LTX works with.
+        outpaint_values = self.settings.get("outpaint", {})
+        source_text = pipeline_source_text(self.settings)
+        aspect = outpaint_values.get("target_aspect", "16:9")
+        height_text = outpaint_values.get("target_height", "720")
+        ref_w, ref_h = outpaint_work_size_for_source(source_text, aspect, height_text)
+        add(["--frame-width", str(ref_w), "--frame-height", str(ref_h)])
+        return cmd
+
+    def _references_command(self, config: dict[str, str], values: dict[str, str]) -> list[str]:
+        if values.get("method", "qwen") == "openai":
+            cmd = [sys.executable, "-u", str(SCRIPTS / "openai_generate_reference.py")]
+            add = cmd.extend
+            add(["--manifest", values.get("manifest", ""), "--api-key", values.get("openai_api_key", "")])
+            add(["--model", values.get("openai_image_model", "gpt-image-2") or "gpt-image-2"])
+            add(["--prompt", values.get("prompt", ""), "--prompt-suffix", values.get("prompt_suffix", "")])
+            add(["--size", values.get("openai_image_size", "auto"), "--quality", values.get("openai_image_quality", "auto")])
+            if is_true(values, "openai_send_references"):
+                add(["--reference-count", "3"])
+        else:
+            cmd = [sys.executable, "-u", str(SCRIPTS / "qwen_colorize_references.py")]
+            add = cmd.extend
+            workflow = qwen_workflow_for(values, config)
+            comfy_url = values.get("comfy_url") or comfy_url_for(config)
+            add(["--manifest", values.get("manifest", ""), "--workflow", workflow, "--comfy-url", comfy_url])
+            add(["--comfy-dir", comfy_dir_for(config), "--comfy-output-root", comfy_output_root_for(config)])
+            add(["--model-backend", values.get("model_backend", "gguf"), "--gguf-model", values.get("gguf_model", QWEN_IMAGE_EDIT_MODEL)])
+            add(["--prompt", values.get("prompt", ""), "--prompt-suffix", values.get("prompt_suffix", ""), "--load-image-node-id", values.get("load_image_node_id", "auto"), "--save-node-id", values.get("save_node_id", "auto")])
+            if values.get("prompt_node_id"):
+                add(["--prompt-node-id", values["prompt_node_id"]])
+        if values.get("limit"):
+            cmd.extend(["--limit", values["limit"]])
+        return cmd
+
+    def _colour_command(self, config: dict[str, str], values: dict[str, str]) -> list[str]:
+        cmd = [sys.executable, "-u", str(SCRIPTS / "colorize_video.py")]
+        add = cmd.extend
+        add(["--manifest", values.get("manifest", "")])
+        method = values.get("method", "deepexemplar")
+        add(["--method", method])
+        output = colorized_output_for_manifest(values.get("manifest", ""), method)
+        if output:
+            add(["--output", output])
+        add(["--comfy-dir", comfy_dir_for(config)])
+        add(["--comfy-url", comfy_url_for(config)])
+        add(["--comfy-output-root", comfy_output_root_for(config)])
+        add(["--crf", values.get("crf", "18")])
+        add(["--colormnet-memory-mode", values.get("colormnet_memory_mode", "balanced")])
+        add(["--colormnet-feature-encoder", values.get("colormnet_feature_encoder", "resnet50")])
+        if values.get("colormnet_text_guidance"):
+            add(["--colormnet-text-guidance", values["colormnet_text_guidance"]])
+        add_bool_flags(cmd, values, ("frame_propagate", "use_half_resolution", "use_torch_compile", "use_sage_attention"))
+        return cmd
+
+    def _recomp_command(self, config: dict[str, str], values: dict[str, str]) -> list[str]:
+        cmd = [sys.executable, "-u", str(SCRIPTS / "final_composite.py")]
+        add = cmd.extend
+        output = values.get("output") or recomposition_output_for(values.get("outpainted_video", ""))
+        add(["--outpainted", values.get("outpainted_video", ""), "--source", values.get("source", ""), "--output", output])
+        if self.colorize_enabled() and values.get("colorized_video"):
+            add(["--colorized", values["colorized_video"]])
+        add(["--feather-pixels", values.get("feather_pixels", "80"), "--saturation", values.get("saturation", "0.82"), "--temperature", values.get("temperature", "-0.015"), "--color-opacity", values.get("color_opacity", "1.0"), "--encoder", values.get("encoder", "h264")])
+        outpaint_values = self.settings.get("outpaint", {})
+        add_value_args(cmd, outpaint_values, ("crop_left", "crop_right", "crop_top", "crop_bottom"), "0")
+        if is_true(outpaint_values, "outpaint_all_black_regions"):
+            add(["--source-black-transparent"])
+        # Pass delivery dimensions so final_composite upscales from the model-safe LTX output
+        # (e.g. 704p) back to the user's intended resolution (e.g. 720p).
+        source_text = pipeline_source_text(self.settings)
+        aspect = outpaint_values.get("target_aspect", "16:9")
+        height_text = outpaint_values.get("target_height", "720")
+        delivery_w, delivery_h = outpaint_size_for_source(source_text, aspect, height_text)
+        add(["--output-width", str(delivery_w), "--output-height", str(delivery_h)])
+        return cmd
+
+    def _audio_command(self, config: dict[str, str], values: dict[str, str]) -> list[str]:
+        cmd = [sys.executable, "-u", str(SCRIPTS / "create_audio_track.py")]
+        add = cmd.extend
+        source = self.soundtrack_source_for() or values.get("input_video", "")
+        output = soundtrack_output_for(source, values)
+        add(["--input", source, "--output", output])
+        add(["--comfy-dir", comfy_dir_for(config)])
+        add(["--comfy-url", comfy_url_for(config)])
+        add(["--comfy-output-root", comfy_output_root_for(config)])
+        if is_true(values, "create_music", "true"):
+            add(["--music"])
+        if is_true(values, "create_sfx", "true"):
+            add(["--sfx"])
+        if values.get("music_prompt"):
+            add(["--music-prompt", values.get("music_prompt", "")])
+        if values.get("music_negative_prompt"):
+            add(["--music-negative", values.get("music_negative_prompt", "")])
+        add(["--music-cue-seconds", values.get("music_cue_seconds", "30")])
+        if values.get("music_checkpoint"):
+            add(["--music-checkpoint", values.get("music_checkpoint", "")])
+        if values.get("sfx_prompt"):
+            add(["--sfx-prompt", values.get("sfx_prompt", "")])
+        if values.get("sfx_negative_prompt"):
+            add(["--sfx-negative", values.get("sfx_negative_prompt", "")])
+        add(["--sfx-chunk-seconds", values.get("sfx_chunk_seconds", "8")])
+        add(["--sfx-short-side", values.get("sfx_short_side", "384")])
+        add(["--music-gain-db", values.get("music_gain_db", "-9")])
+        add(["--sfx-gain-db", values.get("sfx_gain_db", "0")])
+        add(["--seed", values.get("seed", "42")])
+        if values.get("caption_node"):
+            add(["--caption-node", values.get("caption_node", "")])
+        add(["--ollama-vision-model", values.get("ollama_vision_model", "auto")])
+        return cmd
+
+    def _upscale_stage_command(self, config: dict[str, str], values: dict[str, str]) -> list[str]:
+        source = self.upscale_input_for() or values.get("input_video")
+        output = upscale_output_for(source, values) or values.get("output")
+        if not source or not output:
+            return []
+        return self.upscale_command(values, source, output)
 
     def run_stage(self, stage_key: str) -> tuple[bool, str]:
         if self.quitting:
@@ -1202,12 +1245,12 @@ class PipelineApp:
         if stage_key == "audio":
             self.hydrate_stage_inputs("audio")
             audio_values = self.settings.get("audio", {})
-            if audio_values.get("create_music", "true") != "true" and audio_values.get("create_sfx", "true") != "true":
+            if not is_true(audio_values, "create_music", "true") and not is_true(audio_values, "create_sfx", "true"):
                 return False, "Enable Create Music and/or Create Sound Effects on the Audio tab."
             source_text = self.soundtrack_source_for()
             if not source_text or not resolve(source_text).exists():
                 return False, "No finished video is available to add a soundtrack to yet. Run Recomposition first when earlier phases are enabled."
-            if audio_values.get("create_music", "true") == "true":
+            if is_true(audio_values, "create_music", "true"):
                 ok, message = stable_audio_browser_handoff(audio_values.get("music_checkpoint", STABLE_AUDIO_DEFAULT_CHECKPOINT))
                 if not ok:
                     return False, message
@@ -1215,6 +1258,9 @@ class PipelineApp:
             self.hydrate_stage_inputs("upscale")
             if not self.upscale_input_for():
                 return False, "Upscaling input is not available yet. Choose source material, or run Recomposition first when earlier phases are enabled."
+            warning = flashvsr_hardware_warning()
+            if warning:
+                return False, warning
         values = self.settings[stage_key]
         missing = [key for key in stage.required if not values.get(key)]
         if stage_key == "outpaint" and not self.settings.get("global", {}).get("source"):
@@ -1496,9 +1542,9 @@ class PipelineApp:
         add(["--input", source])
         add(["--target-width", str(values.get("target_width", "3840")), "--target-height", str(values.get("target_height", "2160"))])
         add(["--output", output])
-        add(["--comfy-dir", config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))])
-        add(["--comfy-url", config.get("comfy_url", "http://127.0.0.1:8188")])
-        add(["--comfy-output-root", str(Path(config.get("comfy_dir", str(ROOT / "tools" / "comfyui"))) / "output")])
+        add(["--comfy-dir", comfy_dir_for(config)])
+        add(["--comfy-url", comfy_url_for(config)])
+        add(["--comfy-output-root", comfy_output_root_for(config)])
         add(["--flashvsr-model", values.get("flashvsr_model", "FlashVSR-v1.1")])
         add(["--flashvsr-mode", values.get("flashvsr_mode", "tiny")])
         add(["--flashvsr-scale", values.get("flashvsr_scale", "2")])
@@ -1510,10 +1556,8 @@ class PipelineApp:
         add(["--flashvsr-seed", values.get("flashvsr_seed", "0")])
         add(["--chunk-seconds", values.get("chunk_seconds", "6")])
         add(["--overlap-frames", values.get("overlap_frames", "8")])
-        add(["--flashvsr-tiled-vae" if values.get("flashvsr_tiled_vae", "true") == "true" else "--no-flashvsr-tiled-vae"])
-        add(["--flashvsr-tiled-dit" if values.get("flashvsr_tiled_dit", "true") == "true" else "--no-flashvsr-tiled-dit"])
-        add(["--flashvsr-color-fix" if values.get("flashvsr_color_fix", "true") == "true" else "--no-flashvsr-color-fix"])
-        if values.get("flashvsr_unload_dit", "false") == "true":
+        add_bool_flags(cmd, values, ("flashvsr_tiled_vae", "flashvsr_tiled_dit", "flashvsr_color_fix"), "true")
+        if is_true(values, "flashvsr_unload_dit"):
             add(["--flashvsr-unload-dit"])
         return [part for part in cmd if part != ""]
 
@@ -1556,6 +1600,9 @@ class PipelineApp:
         source_text = self.upscale_input_for() or values.get("input_video")
         if not source_text:
             return False, "Choose a source and enable Upscale before generating a preview."
+        warning = flashvsr_hardware_warning()
+        if warning:
+            return False, warning
         seconds = max(0.1, float(values.get("preview_seconds", "6") or 6))
         try:
             source, start, end, key = self.upscale_preview_clip_source(seconds)
@@ -1748,62 +1795,13 @@ class PipelineApp:
 
 
 APP = PipelineApp()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+state.APP = APP  # register the singleton so sibling modules can reach it without importing server
 
 
 def _outpaint_crop_black(values: dict[str, str]) -> tuple[list[int], bool]:
     crop = [int(float(values.get(key, "0") or 0)) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom")]
-    black = values.get("outpaint_all_black_regions", "false") == "true"
+    black = is_true(values, "outpaint_all_black_regions")
     return crop, black
-
-
-def manifest_for_outpainted(outpainted_text: str) -> str:
-    if not outpainted_text:
-        return ""
-    outpainted = resolve(outpainted_text)
-    ident = aid.shots_identity(outpainted.stem)
-    return rel(DATA_ROOT / "manifests" / "references" / aid.artifact_name(aid.source_word(outpainted.name), "shots", ident, "csv"))
 
 
 def outpaint_output_for(source_text: str, aspect: str, target_height_text: str = "720") -> str:
@@ -1843,8 +1841,8 @@ def soundtrack_output_for(source_text: str, values: dict[str, str]) -> str:
     if not source_text:
         return ""
     source = resolve(source_text)
-    music = values.get("create_music", "true") == "true"
-    sfx = values.get("create_sfx", "true") == "true"
+    music = is_true(values, "create_music", "true")
+    sfx = is_true(values, "create_sfx", "true")
     ident = aid.soundtrack_identity(source.stem, music, sfx)
     return rel(DATA_ROOT / "output" / "with_soundtrack" / aid.artifact_name(aid.source_word(source.name), "audio", ident, "mp4"))
 
@@ -1961,7 +1959,7 @@ def ensure_outpaint_prepared_canvas(source_text: str, values: dict[str, str]) ->
         "--delivery-height",
         str(outpaint_size_for_source(source_text, values.get("target_aspect", "16:9"), values.get("target_height", "720"))[1]),
     ]
-    if values.get("outpaint_all_black_regions", "false") == "true":
+    if is_true(values, "outpaint_all_black_regions"):
         cmd.append("--outpaint-all-black-regions")
     APP.log.append(f"Preparing expanded canvas for guide frame: {rel(prepared)}")
     APP.log.append("> " + " ".join(cmd))
@@ -2038,6 +2036,7 @@ def outpaint_chunks_state(settings: dict) -> dict:
         row.setdefault("guide_end_image", "")
         row.setdefault("guide_end_strength", "1.0")
         row.setdefault("guide_frames", "")
+        row.setdefault("auto_start_guide", "true")
         rows.append(row)
     write_outpaint_chunk_rows(manifest, rows)
     view_rows = []
@@ -2113,16 +2112,6 @@ def outpaint_chunk_preview(settings: dict, chunk_index: int, kind: str, position
     return aspect_preview_at(source_text, aspect, start_seconds + offset, offset_x, offset_y)
 
 
-
-
-
-
-
-
-
-
-
-
 def outpaint_chunk_ranges(total_frames: int, fps: float, default_seconds: float, overlap_frames: int, existing: dict[int, dict[str, str]]) -> list[tuple[int, int, int]]:
     ranges = []
     start = 0
@@ -2166,7 +2155,7 @@ def redact_command_for_log(cmd: list[str]) -> str:
     return " ".join(redacted)
 
 
-def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str, custom_seconds: str = "", negative_suffix: str = "", guide_strength: str = "", guide_end_strength: str = "", custom_length=None, offset_x: str = "0", offset_y: str = "0") -> None:
+def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str, custom_seconds: str = "", negative_suffix: str = "", guide_strength: str = "", guide_end_strength: str = "", custom_length=None, offset_x: str = "0", offset_y: str = "0", auto_start_guide=None) -> None:
     state = outpaint_chunks_state(APP.settings)
     manifest_text = state.get("manifest", "")
     if not manifest_text:
@@ -2180,6 +2169,9 @@ def update_outpaint_chunk(index: int, seed: str, prompt_suffix: str, custom_seco
     row["negative_suffix"] = negative_suffix
     row["offset_x"] = str(int(float(offset_x or 0)))
     row["offset_y"] = str(int(float(offset_y or 0)))
+    if auto_start_guide is None:
+        auto_start_guide = row.get("auto_start_guide", "true")
+    row["auto_start_guide"] = "true" if _truthy_payload_value(auto_start_guide) else "false"
     use_custom_length = _truthy_payload_value(custom_length) if custom_length is not None else bool(custom_seconds)
     if use_custom_length and custom_seconds:
         row["custom_seconds"] = f"{max(0.1, float(custom_seconds)):.3f}"
@@ -2335,178 +2327,6 @@ def clear_outpaint_end_guide(index: int) -> dict[str, str]:
     return {"guide_end_image": ""}
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def _browse_allowed_roots() -> list[Path]:
     """Directories the web file picker is allowed to browse (the volume + data/code roots)."""
     roots: list[Path] = []
@@ -2581,33 +2401,8 @@ def pick_global_source(path: str) -> dict:
 
 from .http_handler import Handler, bind_context as bind_http_handler_context
 
-bind_cache_context(globals())
-bind_project_context(globals())
-bind_media_context(globals())
-bind_references_context(globals())
-bind_file_dialogs_context(globals())
-bind_lifecycle_context(globals())
 bind_outpaint_guides_context(globals())
 bind_http_handler_context(globals())
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 APP.normalize_loaded_source_state()

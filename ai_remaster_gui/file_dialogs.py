@@ -6,13 +6,10 @@ import sys
 import os
 from pathlib import Path
 
+from . import state
 from .config import IMAGE_EXTS, ROOT, VIDEO_EXTS
 from .paths import rel, resolve
 from .project_io import last_browse_dir
-
-
-def bind_context(context: dict) -> None:
-    globals().update(context)
 
 
 def parse_duration(value: str | None) -> float | None:
@@ -62,14 +59,14 @@ def browse_initial_path(kind: str, current: str = "") -> Path:
     return ROOT
 
 def remember_browse_dir(selected: str) -> None:
-    if not selected or "APP" not in globals():
+    if not selected or state.APP is None:
         return
     path = resolve(selected)
     folder = path if path.is_dir() else path.parent
     if not folder.exists():
         return
-    APP.settings.setdefault("global", {})["last_browse_dir"] = str(folder)
-    APP.save()
+    state.APP.settings.setdefault("global", {})["last_browse_dir"] = str(folder)
+    state.APP.save()
 
 def browse_path_windows(kind: str, initial: Path) -> str:
     initial_dir = initial if initial.is_dir() else initial.parent
@@ -133,8 +130,8 @@ $dialog.InitialDirectory = '{initial_text}'
 $dialog.Filter = '{filter_text}'
 {show_script}
 """
-    if "APP" in globals():
-        APP.log.append(f"Opening Windows browse dialog for {kind}: {initial_dir}")
+    if state.APP is not None:
+        state.APP.log.append(f"Opening Windows browse dialog for {kind}: {initial_dir}")
     result = subprocess.run(
         ["powershell", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", script],
         check=False,
@@ -145,9 +142,9 @@ $dialog.Filter = '{filter_text}'
         raise RuntimeError((result.stderr or result.stdout or "Windows file dialog failed.").strip())
     selected = result.stdout.strip()
     if selected:
-        APP.log.append(f"Browse selected: {selected}")
+        state.APP.log.append(f"Browse selected: {selected}")
     else:
-        APP.log.append("Browse cancelled.")
+        state.APP.log.append("Browse cancelled.")
     return rel(Path(selected)) if selected else ""
 
 def browse_path_macos(kind: str, initial: Path) -> str:
@@ -164,14 +161,14 @@ def browse_path_macos(kind: str, initial: Path) -> str:
     if result.returncode != 0:
         stderr = result.stderr.strip()
         if "User canceled" in stderr or "(-128)" in stderr:
-            APP.log.append("Browse cancelled.")
+            state.APP.log.append("Browse cancelled.")
             return ""
         raise RuntimeError(stderr or "macOS file dialog failed.")
     selected = result.stdout.strip()
     if selected:
-        APP.log.append(f"Browse selected: {selected}")
+        state.APP.log.append(f"Browse selected: {selected}")
     else:
-        APP.log.append("Browse cancelled.")
+        state.APP.log.append("Browse cancelled.")
     return rel(Path(selected)) if selected else ""
 
 def applescript_quote(value: str) -> str:
@@ -194,11 +191,11 @@ def browse_path_zenity(kind: str, initial: Path) -> str:
         command.append("--save")
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     if result.returncode != 0:
-        APP.log.append("Browse cancelled.")
+        state.APP.log.append("Browse cancelled.")
         return ""
     selected = result.stdout.strip()
     if selected:
-        APP.log.append(f"Browse selected: {selected}")
+        state.APP.log.append(f"Browse selected: {selected}")
     return rel(Path(selected)) if selected else ""
 
 def browse_path_kdialog(kind: str, initial: Path) -> str:
@@ -210,9 +207,9 @@ def browse_path_kdialog(kind: str, initial: Path) -> str:
         command = ["kdialog", "--getopenfilename", str(initial)]
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     if result.returncode != 0:
-        APP.log.append("Browse cancelled.")
+        state.APP.log.append("Browse cancelled.")
         return ""
     selected = result.stdout.strip()
     if selected:
-        APP.log.append(f"Browse selected: {selected}")
+        state.APP.log.append(f"Browse selected: {selected}")
     return rel(Path(selected)) if selected else ""

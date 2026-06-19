@@ -9,6 +9,7 @@ import time
 _CACHE: dict[str, object] = {"at": 0.0, "data": {}}
 _CACHE_SECONDS = 5.0
 _CPU_TIMES: tuple[int, int] | None = None
+FLASHVSR_MIN_CUDA_CAPABILITY = (7, 5)
 
 
 class _MemoryStatus(ctypes.Structure):
@@ -56,12 +57,27 @@ def cuda_status() -> dict:
         import torch  # type: ignore
 
         available = bool(torch.cuda.is_available())
+        detail = torch.cuda.get_device_name(0) if available else f"torch {torch.__version__}"
+        capability: tuple[int, int] | None = None
+        warning = ""
+        if available:
+            try:
+                major, minor = torch.cuda.get_device_capability(0)
+                capability = (int(major), int(minor))
+                detail = f"{detail} - compute capability {format_cuda_capability(capability)}"
+                if capability < FLASHVSR_MIN_CUDA_CAPABILITY:
+                    warning = flashvsr_hardware_warning(detail, capability)
+            except Exception as exc:
+                detail = f"{detail} - compute capability unknown: {exc}"
         return {
             "available": available,
             "label": "CUDA available" if available else "CUDA unavailable",
-            "detail": torch.cuda.get_device_name(0) if available else f"torch {torch.__version__}",
+            "detail": detail,
             "torch": str(torch.__version__),
             "cuda": str(torch.version.cuda or ""),
+            "capability": format_cuda_capability(capability) if capability else "",
+            "flashvsr_supported": available and bool(capability) and capability >= FLASHVSR_MIN_CUDA_CAPABILITY,
+            "warning": warning,
         }
     except Exception as exc:
         return {
@@ -70,7 +86,34 @@ def cuda_status() -> dict:
             "detail": str(exc),
             "torch": "",
             "cuda": "",
+            "capability": "",
+            "flashvsr_supported": False,
+            "warning": "",
         }
+
+
+def flashvsr_hardware_warning(device_detail: str | None = None, capability: tuple[int, int] | None = None) -> str:
+    if capability is None:
+        try:
+            import torch  # type: ignore
+
+            if not torch.cuda.is_available():
+                return ""
+            capability = tuple(int(part) for part in torch.cuda.get_device_capability(0))
+            device_detail = torch.cuda.get_device_name(0)
+        except Exception:
+            return ""
+    if capability >= FLASHVSR_MIN_CUDA_CAPABILITY:
+        return ""
+    device = f"{device_detail or 'This GPU'} reports compute capability {format_cuda_capability(capability)}"
+    required = format_cuda_capability(FLASHVSR_MIN_CUDA_CAPABILITY)
+    return f"{device}. FlashVSR upscaling requires NVIDIA compute capability {required}+; disable Upscale or use a newer NVIDIA GPU."
+
+
+def format_cuda_capability(capability: tuple[int, int] | None) -> str:
+    if not capability:
+        return ""
+    return f"{capability[0]}.{capability[1]}"
 
 
 def ram_status() -> dict:

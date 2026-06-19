@@ -9,9 +9,12 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from . import state
 from .cache import human_size
 from .config import ASPECT_PREVIEW_DIR, FILE_PREVIEW_DIR, IMAGE_EXTS, MEDIA_CLIP_DIR, PREVIEW_DIR, ROOT, SCRIPTS, VIDEO_EXTS
-from .paths import parse_aspect, rel, resolve, resolve_video_source, safe_stem
+from .file_dialogs import browse_path, parse_duration
+from .paths import even_int, format_timecode, parse_aspect, rel, resolve, resolve_video_source, safe_stem
+from .process_utils import format_duration
 from .project_io import source_analysis_key, source_signature
 from .config import DATA_ROOT
 from .config import CACHE_ROOT
@@ -40,16 +43,12 @@ def aspect_preview_identity(source: Path, size: int, mtime_ns: int, aspect: str,
     }
 
 
-def bind_context(context: dict) -> None:
-    globals().update(context)
-
-
 def source_previews(source_text: str) -> list[str]:
     signature = source_signature(source_text)
     if signature is None:
         if source_text:
             source = resolve(source_text)
-            APP.log.append(f"Source preview skipped; file was not found or is not a supported video: {source}")
+            state.APP.log.append(f"Source preview skipped; file was not found or is not a supported video: {source}")
         return []
     return list(source_previews_cached(*signature))
 
@@ -62,12 +61,12 @@ def source_previews_for_analysis(signature: tuple[str, int, int], info: dict[str
     try:
         if all(frame.exists() and frame.stat().st_mtime_ns >= mtime_ns for frame in frames):
             return tuple(rel(frame) for frame in frames)
-        APP.log.append(f"Generating source previews from: {source}")
+        state.APP.log.append(f"Generating source previews from: {source}")
         generate_video_previews(source, target_dir, progress, parse_duration(info.get("duration")))
-        APP.log.append(f"Generated source previews in: {target_dir}")
+        state.APP.log.append(f"Generated source previews in: {target_dir}")
         return tuple(rel(frame) for frame in frames if frame.exists())
     except Exception as exc:
-        APP.log.append(f"Could not generate source previews: {exc}")
+        state.APP.log.append(f"Could not generate source previews: {exc}")
         return ()
 
 def source_previews_cached(source_path: str, _size: int, mtime_ns: int) -> tuple[str, ...]:
@@ -78,12 +77,12 @@ def source_previews_cached(source_path: str, _size: int, mtime_ns: int) -> tuple
     try:
         if all(frame.exists() and frame.stat().st_mtime_ns >= mtime_ns for frame in frames):
             return tuple(rel(frame) for frame in frames)
-        APP.log.append(f"Generating {SOURCE_PREVIEW_COUNT} source previews from: {source}")
+        state.APP.log.append(f"Generating {SOURCE_PREVIEW_COUNT} source previews from: {source}")
         generate_video_previews(source, target_dir)
-        APP.log.append(f"Generated source previews in: {target_dir}")
+        state.APP.log.append(f"Generated source previews in: {target_dir}")
         return tuple(rel(frame) for frame in frames if frame.exists())
     except Exception as exc:
-        APP.log.append(f"Could not generate source previews: {exc}")
+        state.APP.log.append(f"Could not generate source previews: {exc}")
         return ()
 
 def source_info(source_text: str) -> dict[str, str]:
@@ -91,7 +90,7 @@ def source_info(source_text: str) -> dict[str, str]:
     if signature is None:
         if source_text:
             source = resolve(source_text)
-            APP.log.append(f"Source info skipped; file was not found or is not a supported video: {source}")
+            state.APP.log.append(f"Source info skipped; file was not found or is not a supported video: {source}")
         return {}
     return dict(source_info_cached(*signature))
 
@@ -124,13 +123,13 @@ def source_monochrome_cached(source_path: str, size: int, mtime_ns: int) -> bool
 
 def source_info_cached(source_path: str, size: int, _mtime_ns: int) -> tuple[tuple[str, str], ...]:
     source = Path(source_path)
-    APP.log.append(f"Probing source file info: {source}")
+    state.APP.log.append(f"Probing source file info: {source}")
     info: dict[str, str] = {"file": rel(source), "size": human_size(size)}
     info.update(ffprobe_info(source))
     return tuple(info.items())
 
 def current_crop_values() -> tuple[int, int, int, int]:
-    values = APP.settings.get("outpaint", {}) if "APP" in globals() else {}
+    values = state.APP.settings.get("outpaint", {}) if state.APP is not None else {}
     return tuple(max(0, int(float(values.get(key, "0") or 0))) for key in ("crop_left", "crop_right", "crop_top", "crop_bottom"))  # type: ignore[return-value]
 
 def aspect_preview(source_text: str, aspect: str) -> str:
@@ -191,8 +190,8 @@ def auto_crop_for_settings(settings: dict, seconds: float) -> dict[str, str | in
         "crop_top": str(top),
         "crop_bottom": str(bottom),
     }
-    APP.update_settings("outpaint", values)
-    APP.log.append(f"Auto Crop set source crop to left {left}, right {right}, top {top}, bottom {bottom}.")
+    state.APP.update_settings("outpaint", values)
+    state.APP.log.append(f"Auto Crop set source crop to left {left}, right {right}, top {top}, bottom {bottom}.")
     return {**values, "preview": aspect_preview_at_for_settings(settings, seconds)}
 
 def detect_letterbox_crop(image) -> tuple[int, int, int, int]:
@@ -238,7 +237,7 @@ def preview_pipeline_source_text(settings: dict) -> str:
     try:
         ensure_source_section_clip(settings)
     except Exception as exc:
-        APP.log.append(f"Could not prepare selected source section for preview: {exc}")
+        state.APP.log.append(f"Could not prepare selected source section for preview: {exc}")
     return pipeline_source_text(settings)
 
 def section_relative_seconds(settings: dict, seconds: float) -> float:
@@ -262,7 +261,7 @@ def aspect_preview_cached(source_path: str, size: int, mtime_ns: int, aspect: st
     try:
         from PIL import Image, ImageOps
     except ModuleNotFoundError:
-        APP.log.append("Pillow is not available; using FFmpeg for the aspect preview.")
+        state.APP.log.append("Pillow is not available; using FFmpeg for the aspect preview.")
         preview = ffmpeg_aspect_preview(source, target, aspect, mtime_ns, offset_x, offset_y)
         if preview:
             aid.write_identity(target, identity, label="Aspect preview")
@@ -352,7 +351,7 @@ def ffmpeg_aspect_preview(source: Path, target: Path, aspect: str, mtime_ns: int
         command[3] = "0"
         result = subprocess.run(command, check=False, capture_output=True, text=True)
     if result.returncode != 0:
-        APP.log.append(f"Could not generate aspect preview: {(result.stderr or result.stdout).strip()}")
+        state.APP.log.append(f"Could not generate aspect preview: {(result.stderr or result.stdout).strip()}")
     return rel(target) if result.returncode == 0 and target.exists() and target.stat().st_mtime_ns >= mtime_ns else ""
 
 def video_dimensions(source: Path) -> tuple[int, int] | None:
@@ -667,7 +666,7 @@ def export_media_file(path_text: str) -> dict[str, str]:
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.resolve() != source.resolve():
         shutil.copy2(source, target)
-    APP.log.append(f"Saved media file: {rel(source)} -> {target}")
+    state.APP.log.append(f"Saved media file: {rel(source)} -> {target}")
     return {"saved": str(target)}
 
 def generate_video_previews(source: Path, target_dir: Path, progress: Callable[[int, str], None] | None = None, duration: float | None = None) -> None:
@@ -702,10 +701,10 @@ def generate_video_previews(source: Path, target_dir: Path, progress: Callable[[
         try:
             result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=30)
         except subprocess.TimeoutExpired:
-            APP.log.append(f"Preview frame {index + 1} timed out at {seconds:.3f}s; skipping it.")
+            state.APP.log.append(f"Preview frame {index + 1} timed out at {seconds:.3f}s; skipping it.")
             continue
         if result.returncode != 0:
-            APP.log.append(f"Preview frame {index + 1} failed: {(result.stderr or result.stdout).strip()}")
+            state.APP.log.append(f"Preview frame {index + 1} failed: {(result.stderr or result.stdout).strip()}")
 
 
 def pipeline_source_text(settings: dict) -> str:
@@ -757,13 +756,15 @@ def ensure_source_section_clip(settings: dict) -> str:
     if end <= start:
         return source_text
     output = source_section_output_for(settings)
-    if output.exists() and output.stat().st_size > 0:
-        return rel(output)
     ffmpeg = local_tool("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("Run install_windows.bat to install local FFmpeg for source section trimming.")
+    expected_duration = max(0.041, end - start)
+    if source_section_clip_is_valid(output, ffmpeg, expected_duration):
+        return rel(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     partial = output.with_suffix(output.suffix + ".partial" + output.suffix)
+    has_audio = source_has_audio_stream(ffmpeg, source)
     command = [
         ffmpeg,
         "-y",
@@ -777,14 +778,14 @@ def ensure_source_section_clip(settings: dict) -> str:
         "0:v:0",
         "-map",
         "0:a?",
+        "-vf",
+        "setpts=PTS-STARTPTS",
         "-c:v",
         "libx264",
         "-crf",
         "14",
         "-preset",
         "veryfast",
-        "-c:a",
-        "copy",
         "-sn",
         "-dn",
         "-map_metadata",
@@ -793,12 +794,104 @@ def ensure_source_section_clip(settings: dict) -> str:
         "+faststart",
         str(partial),
     ]
+    if has_audio:
+        audio_args = ["-af", "asetpts=PTS-STARTPTS", "-c:a", "aac", "-b:a", "192k"]
+        command[command.index("-sn"):command.index("-sn")] = audio_args
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "ffmpeg source section trim failed").strip())
     partial.replace(output)
-    APP.log.append(f"Prepared source section clip: {rel(output)}")
+    log_media_message(f"Prepared source section clip: {rel(output)}")
     return rel(output)
+
+def source_section_clip_is_valid(output: Path, ffmpeg: str, expected_duration: float) -> bool:
+    if not output.exists() or output.stat().st_size <= 0:
+        return False
+    try:
+        timing = source_section_timing(ffmpeg, output)
+    except Exception:
+        return True
+    first_pts = timing.get("first_pts")
+    duration = timing.get("duration")
+    if first_pts is not None and abs(first_pts) > 0.25:
+        log_media_message(f"Regenerating source section with non-zero first video timestamp: {rel(output)} ({first_pts:.3f}s)")
+        return False
+    if duration is not None and expected_duration > 0 and abs(duration - expected_duration) > 1.0:
+        log_media_message(
+            f"Regenerating source section with mismatched duration: {rel(output)} "
+            f"({duration:.3f}s, expected {expected_duration:.3f}s)"
+        )
+        return False
+    return True
+
+def source_section_timing(ffmpeg: str, output: Path) -> dict[str, float | None]:
+    ffprobe = ffprobe_for_ffmpeg(ffmpeg)
+    result = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-read_intervals",
+            "%+#1",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=start_time,duration:packet=pts_time",
+            "-of",
+            "json",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout or "{}")
+    packets = payload.get("packets") or []
+    streams = payload.get("streams") or [{}]
+    stream = streams[0] if streams else {}
+    first_pts = float(packets[0]["pts_time"]) if packets and packets[0].get("pts_time") is not None else _optional_float(stream.get("start_time"))
+    return {"first_pts": first_pts, "duration": _optional_float(stream.get("duration"))}
+
+def source_has_audio_stream(ffmpeg: str, source: Path) -> bool:
+    try:
+        ffprobe = ffprobe_for_ffmpeg(ffmpeg)
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "json",
+                str(source),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return bool(json.loads(result.stdout or "{}").get("streams"))
+    except Exception:
+        return True
+
+def ffprobe_for_ffmpeg(ffmpeg: str) -> str:
+    path = Path(ffmpeg)
+    if path.suffix.lower() == ".exe":
+        return str(path.with_name("ffprobe.exe"))
+    return "ffprobe"
+
+def _optional_float(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+def log_media_message(message: str) -> None:
+    app = getattr(state, "APP", None)
+    if app is not None:
+        app.log.append(message)
 
 def section_float(value: str, default: float) -> float:
     try:

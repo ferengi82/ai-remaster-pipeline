@@ -299,12 +299,28 @@ def transition_seconds(row: dict[str, str]) -> float:
     except ValueError:
         return 0.0
 
+def optional_int(value: str | None) -> int | None:
+    try:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        return int(float(text))
+    except ValueError:
+        return None
+
 
 def shot_plan(rows: list[dict[str, str]], total_frames: int, fps: float) -> tuple[list[dict[str, int]], list[int]]:
     base: list[tuple[int, int]] = []
     start_frame = 0
     for index, row in enumerate(rows):
-        end_frame = min(total_frames, max(start_frame + 1, round(parse_time(row.get("end", "")) * fps)))
+        row_start = optional_int(row.get("start_frame"))
+        row_end = optional_int(row.get("end_frame"))
+        if row_start is not None:
+            start_frame = max(0, min(total_frames - 1, row_start))
+        if row_end is not None:
+            end_frame = min(total_frames, max(start_frame + 1, row_end))
+        else:
+            end_frame = min(total_frames, max(start_frame + 1, round(parse_time(row.get("end", "")) * fps)))
         if index == len(rows) - 1:
             end_frame = total_frames
         base.append((start_frame, end_frame))
@@ -399,7 +415,7 @@ def xfade_group(ffmpeg: str, chunks: list[Path], transitions: list[int], output:
 
     filters: list[str] = []
     for index in range(len(chunks)):
-        filters.append(f"[{index}:v]fps=fps={fps:.8f},setpts=PTS-STARTPTS[v{index}]")
+        filters.append(f"[{index}:v]setpts=N/({fps:.8f}*TB),fps=fps={fps:.8f}[v{index}]")
 
     previous = "v0"
     accumulated = video_info(chunks[0])["frames"] / fps

@@ -39,7 +39,7 @@ ADVANCED_DEFAULTS = {
 
 def signature(args: argparse.Namespace, source: Path, output_width: int, output_height: int) -> dict[str, Any]:
     sig = {
-        "version": 4,
+        "version": 5,
         "tool": "upscale_video.py",
         "method": "flashvsr_ultra_fast",
         "source": root_relative(source),
@@ -242,19 +242,20 @@ def split_video_chunk(ffmpeg: str, source: Path, target: Path, start_frame: int,
     if target.exists() and not force and split_matches_source(target, source_fingerprint):
         return
     target.parent.mkdir(parents=True, exist_ok=True)
-    start_seconds = start_frame / fps
-    duration_seconds = max(1 / fps, (end_frame - start_frame) / fps)
     partial = target.with_suffix(target.suffix + ".partial" + target.suffix)
+    vf = f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=N/({fps:.8f}*TB),fps={fps:.8f},setsar=1"
     command = [
         ffmpeg,
         "-y",
-        "-ss",
-        f"{start_seconds:.6f}",
-        "-t",
-        f"{duration_seconds:.6f}",
         "-i",
         str(source),
+        "-vf",
+        vf,
         "-an",
+        "-r",
+        f"{fps:.8f}",
+        "-fps_mode",
+        "cfr",
         "-c:v",
         "libx264",
         "-crf",
@@ -272,14 +273,16 @@ def split_video_chunk(ffmpeg: str, source: Path, target: Path, start_frame: int,
     write_split_sidecar(target, source, source_fingerprint)
 
 
-def normalize_chunk(ffmpeg: str, source: Path, target: Path, width: int, height: int, trim_start: int, force: bool) -> None:
+def normalize_chunk(ffmpeg: str, source: Path, target: Path, width: int, height: int, trim_start: int, fps: float, force: bool) -> None:
     if target.exists() and not force:
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_suffix(target.suffix + ".partial" + target.suffix)
     filters = []
     if trim_start > 0:
-        filters.append(f"trim=start_frame={trim_start},setpts=PTS-STARTPTS")
+        filters.append(f"trim=start_frame={trim_start}")
+    filters.append(f"setpts=N/({fps:.8f}*TB)")
+    filters.append(f"fps={fps:.8f}")
     filters.append(f"scale={width}:{height}:flags=lanczos,setsar=1")
     command = [
         ffmpeg,
@@ -289,6 +292,10 @@ def normalize_chunk(ffmpeg: str, source: Path, target: Path, width: int, height:
         "-vf",
         ",".join(filters),
         "-an",
+        "-r",
+        f"{fps:.8f}",
+        "-fps_mode",
+        "cfr",
         "-c:v",
         "libx264",
         "-crf",
@@ -426,7 +433,7 @@ def chunked_flashvsr_run(args: argparse.Namespace, source: Path, output: Path, o
             flashvsr_run(args, chunk_input, chunk_raw, output_width, output_height, comfy_url=url)
         finally:
             url_pool.put(url)
-        normalize_chunk(ffmpeg, chunk_raw, chunk_final, output_width, output_height, trim_start, True)
+        normalize_chunk(ffmpeg, chunk_raw, chunk_final, output_width, output_height, trim_start, fps, True)
         write_signature(chunk_final, chunk_sig)
         chunk_raw.unlink(missing_ok=True)
         print(f"Wrote upscaled chunk {index + 1}/{len(ranges)}: {chunk_final}", flush=True)

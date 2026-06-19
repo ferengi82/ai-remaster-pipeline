@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 
-from .config import ROOT, VIDEO_EXTS
+from .config import ROOT, VIDEO_EXTS, comfy_dir_for
 
 
 def rel(path: Path) -> str:
@@ -15,6 +16,39 @@ def rel(path: Path) -> str:
 def resolve(text: str) -> Path:
     path = Path(text).expanduser()
     return path if path.is_absolute() else ROOT / path
+
+
+def is_within(path: Path, root: Path) -> bool:
+    """True when path is root itself or nested under it (both resolved first)."""
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def served_roots(extra_paths: Iterable[str] = ()) -> list[Path]:
+    """Directories the GUI may read files from when answering browser requests: the project
+    tree, the ComfyUI install (and its output folder), and the folder of any explicitly
+    chosen file passed in extra_paths (the source video legitimately lives anywhere on disk)."""
+    comfy_dir = Path(comfy_dir_for())
+    roots = [ROOT, comfy_dir, comfy_dir / "output"]
+    for text in extra_paths:
+        if not text:
+            continue
+        candidate = resolve(text)
+        roots.append(candidate if candidate.is_dir() else candidate.parent)
+    return roots
+
+
+def resolve_served(text: str, extra_paths: Iterable[str] = ()) -> Path | None:
+    """Resolve a browser-supplied path, returning it only when it stays inside an allowed
+    root (see served_roots). Returns None for paths that escape — callers answer 404 — so a
+    malicious page cannot read arbitrary files such as C:/Windows/win.ini or /etc/passwd."""
+    if not text:
+        return None
+    path = resolve(text)
+    return path if any(is_within(path, root) for root in served_roots(extra_paths)) else None
 
 
 def resolve_video_source(text: str) -> Path:
@@ -73,3 +107,11 @@ def parse_aspect(value: str) -> float:
         left, right = value.split(":", 1)
         return float(left) / float(right)
     return float(value)
+
+
+def format_timecode(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"

@@ -37,7 +37,7 @@ def signature(args):
             values[key + '_fingerprint'] = file_fingerprint(path)
     values.pop('ffmpeg', None)
     values['tool'] = 'final_composite.py'
-    values['version'] = 4
+    values['version'] = 7
     return values
 
 
@@ -95,6 +95,50 @@ def source_crop_filter(args) -> str:
     return f"crop=w=iw-{left}-{right}:h=ih-{top}-{bottom}:x={left}:y={top},"
 
 
+def nested_expr(fn: str, values: list[str]) -> str:
+    if not values:
+        return "0"
+    expr = values[0]
+    for value in values[1:]:
+        expr = f"{fn}({expr},{value})"
+    return expr
+
+
+def source_rgb_max_expr(x_expr: str = "X", y_expr: str = "Y") -> str:
+    return f"max(max(r({x_expr},{y_expr}),g({x_expr},{y_expr})),b({x_expr},{y_expr}))"
+
+
+def source_black_matte_expr(threshold: int, shrink: int) -> str:
+    radius = max(0, min(8, int(shrink)))
+    offsets = [(0, 0)]
+    if radius:
+        offsets.extend([
+            (-radius, 0),
+            (radius, 0),
+            (0, -radius),
+            (0, radius),
+            (-radius, -radius),
+            (radius, -radius),
+            (-radius, radius),
+            (radius, radius),
+        ])
+    samples = []
+    for dx, dy in offsets:
+        x = "X" if dx == 0 else f"min(max(X{dx:+d},0),W-1)"
+        y = "Y" if dy == 0 else f"min(max(Y{dy:+d},0),H-1)"
+        samples.append(source_rgb_max_expr(x, y))
+    return f"lte({nested_expr('min', samples)},{threshold})"
+
+
+def source_alpha_expr(args, feather: int) -> str:
+    edge_alpha = f"if(lt(X,{feather}),255*X/{feather},if(gt(X,W-{feather}),255*(W-X)/{feather},255))"
+    if not getattr(args, "source_black_transparent", False):
+        return edge_alpha
+    threshold = max(0, min(255, int(getattr(args, "source_black_threshold", 24))))
+    shrink = max(0, min(8, int(getattr(args, "source_black_matte_shrink_pixels", 2))))
+    return f"if({source_black_matte_expr(threshold, shrink)},0,{edge_alpha})"
+
+
 def build_filter(args, has_color, fps: float):
     feather = max(1, int(args.feather_pixels))
     sat = max(0.0, args.saturation)
@@ -109,18 +153,16 @@ def build_filter(args, has_color, fps: float):
     out_h = int(args.output_height) if args.output_height else 0
     scale_base = f",scale={out_w}:{out_h}:flags=lanczos" if (out_w and out_h) else ""
     filters = [
-        f'[0:v]fps=fps={fps_text},setpts=N/({fps_text}*TB){scale_base}[base0]',
-        f'[1:v]fps=fps={fps_text},{crop}setpts=N/({fps_text}*TB)[src0]',
+        f'[0:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}{scale_base}[base0]',
+        f'[1:v]setpts=N/({fps_text}*TB),fps=fps={fps_text},{crop}setsar=1[src0]',
         '[src0][base0]scale2ref=w=trunc(oh*mdar/2)*2:h=ih[src][base]',
-        f"[src]format=rgba,split[src_rgb][src_a]",
-        f"[src_a]alphaextract,geq=lum='if(lt(X,{feather}),255*X/{feather},if(gt(X,W-{feather}),255*(W-X)/{feather},255))'[mask]",
-        '[src_rgb][mask]alphamerge[srcm]',
+        f"[src]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{source_alpha_expr(args, feather)}'[srcm]",
         '[base][srcm]overlay=x=(W-w)/2:y=(H-h)/2[merged]',
     ]
     if has_color:
         red = max(temp, 0.0)
         blue = max(-temp, 0.0)
-        filters.append(f'[2:v]fps=fps={fps_text},setpts=N/({fps_text}*TB)[col0]')
+        filters.append(f'[2:v]setpts=N/({fps_text}*TB),fps=fps={fps_text}[col0]')
         filters.append('[col0][merged]scale2ref=w=iw:h=ih[colscaled][mergedref]')
         filters.append(f'[colscaled]eq=saturation={sat}:brightness=0:contrast=1,colorbalance=rs={red:.4f}:bs={blue:.4f},format=yuv444p[colfmt]')
         filters.append('[mergedref]format=yuv444p[basefmt]')
@@ -187,6 +229,9 @@ def build_parser():
     parser.add_argument('--color-opacity', type=float, default=1.0)
     parser.add_argument('--output-width', type=int, default=0, help='Scale outpainted video to this width before compositing (delivery upscale, e.g. 1280 to correct 704→720).')
     parser.add_argument('--output-height', type=int, default=0, help='Scale outpainted video to this height before compositing (delivery upscale, e.g. 720 to correct 704→720).')
+    parser.add_argument('--source-black-transparent', action='store_true', help='Treat near-black source pixels as transparent so outpainted regions remain visible in the final composite.')
+    parser.add_argument('--source-black-threshold', type=int, default=24, help='Maximum RGB channel value considered source black when --source-black-transparent is enabled.')
+    parser.add_argument('--source-black-matte-shrink-pixels', type=int, default=2, help='Shrink the source matte by this many pixels around detected black regions to avoid dark resampling halos.')
     parser.add_argument('--crop-left', type=int, default=0)
     parser.add_argument('--crop-right', type=int, default=0)
     parser.add_argument('--crop-top', type=int, default=0)

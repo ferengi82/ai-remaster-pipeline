@@ -1054,7 +1054,7 @@ Invoke-Step 'Install ComfyUI custom nodes' {
     if (-not $SkipComfyManager) {
         Git-Clone-IfMissing 'https://github.com/ltdrdata/ComfyUI-Manager.git' (Join-Path $CustomNodes 'ComfyUI-Manager') -UpdateExisting
     }
-    Install-CustomNodePackage 'ComfyUI-LTXVideo' 'https://github.com/Lightricks/ComfyUI-LTXVideo.git' (Join-Path $CustomNodes 'ComfyUI-LTXVideo') -UpdateExisting
+    Install-CustomNodePackage 'ComfyUI-LTXVideo' 'https://github.com/Lightricks/ComfyUI-LTXVideo.git' (Join-Path $CustomNodes 'ComfyUI-LTXVideo') -UpdateExisting -PreferBundled
     Install-CustomNodePackage 'ComfyUI-GGUF' 'https://github.com/city96/ComfyUI-GGUF.git' (Join-Path $CustomNodes 'ComfyUI-GGUF') -UpdateExisting
     Install-CustomNodePackage 'ComfyUI-VideoHelperSuite' 'https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git' (Join-Path $CustomNodes 'ComfyUI-VideoHelperSuite') -UpdateExisting
     Install-CustomNodePackage 'ComfyUI-FlashVSR_Ultra_Fast' 'https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast.git' (Join-Path $CustomNodes 'ComfyUI-FlashVSR_Ultra_Fast') -UpdateExisting

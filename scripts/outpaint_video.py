@@ -823,6 +823,11 @@ def read_chunk_manifest(path: Path) -> dict[int, dict[str, str]]:
         return rows
 
 
+def auto_start_guide_enabled(row: dict[str, str]) -> bool:
+    value = str(row.get("auto_start_guide", "")).strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
 def write_chunk_manifest(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = [
@@ -842,6 +847,7 @@ def write_chunk_manifest(path: Path, rows: list[dict[str, str]]) -> None:
         "guide_end_image",
         "guide_end_strength",
         "guide_frames",
+        "auto_start_guide",
         "anchor_image",
         "anchor_position",
         "anchor_seconds",
@@ -917,6 +923,7 @@ def sync_chunk_manifest(path: Path, ranges: list[tuple[int, int, int]], fps: flo
         row.setdefault("negative_suffix", "")
         row.setdefault("guide_image", "")
         row.setdefault("custom_seconds", "")
+        row.setdefault("auto_start_guide", "true")
         rows.append(row)
     write_chunk_manifest(path, rows)
     return {int(row["chunk_index"]): row for row in rows}
@@ -1289,7 +1296,7 @@ def main() -> int:
         required_nodes = dict(OUTPAINT_REQUIRED_NODES)
         if args.model_backend == "gguf":
             required_nodes["UnetLoaderGGUF"] = "ComfyUI-GGUF"
-        ensure_node_types(args.comfy_url, required_nodes, "outpainting workflow")
+        ensure_node_types(args.comfy_url, required_nodes, "outpainting workflow", comfy_dir)
 
     prepare_command = [
         sys.executable,
@@ -1407,13 +1414,16 @@ def main() -> int:
 
                 auto_guide: bool = False
                 guide_image: Path | None = explicit_guide
-                if guide_image is None and previous_raw is not None and previous_raw.exists():
+                use_auto_start_guide = auto_start_guide_enabled(chunk_row)
+                if guide_image is None and previous_raw is not None and previous_raw.exists() and use_auto_start_guide:
                     try:
                         guide_image = extract_last_frame_as_guide(previous_raw, chunk_dir)
                         auto_guide = True
                         print(f"Chunk {chunk_index + 1}: auto-guide from last frame of chunk {chunk_index}", flush=True)
                     except Exception as exc:
                         print(f"Warning: could not extract auto-guide from previous chunk: {exc}", flush=True)
+                elif guide_image is None and previous_raw is not None and previous_raw.exists() and not use_auto_start_guide:
+                    print(f"Chunk {chunk_index + 1}: previous-chunk start guide disabled", flush=True)
 
                 chunk_sig = raw_signature(args, workflow_path, chunk_prepared, chunk_seed, chunk_prompt_suffix, chunk_negative_suffix, guide_image, extra_guides, auto_guide)
                 if args.only_chunk is not None and chunk_index != args.only_chunk:

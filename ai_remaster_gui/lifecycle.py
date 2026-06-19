@@ -19,10 +19,6 @@ STARTED_COMFY_PROCESS: subprocess.Popen | None = None
 COMFY_STARTUP_LOG = DATA_ROOT / "output" / "logs" / "comfyui-startup.log"
 
 
-def bind_context(context: dict) -> None:
-    globals().update(context)
-
-
 def ensure_comfy_available_for_stage(stage_title: str) -> tuple[bool, str]:
     if os.environ.get("AI_REMASTER_NO_COMFY_AUTOSTART") == "1":
         return True, ""
@@ -43,10 +39,20 @@ def ensure_comfy_available_for_stage(stage_title: str) -> tuple[bool, str]:
         return True, ""
     if STARTED_COMFY_PROCESS and STARTED_COMFY_PROCESS.poll() is None:
         startup_log(f"ComfyUI launch is already in progress at {url}.")
-        return True, ""
+        if wait_for_comfy_ready(url, STARTED_COMFY_PROCESS, float(os.environ.get("AI_REMASTER_COMFY_START_TIMEOUT", "180"))):
+            return True, ""
+        message = comfy_startup_failure_message(url, stage_title)
+        startup_log(message)
+        return False, message
     startup_log(f"ComfyUI is not running at {url}; launching it now.")
-    start_comfy_if_needed()
-    return True, ""
+    if not start_comfy_if_needed(monitor=False):
+        message = comfy_startup_failure_message(url, stage_title)
+        return False, message
+    if wait_for_comfy_ready(url, STARTED_COMFY_PROCESS, float(os.environ.get("AI_REMASTER_COMFY_START_TIMEOUT", "180"))):
+        return True, ""
+    message = comfy_startup_failure_message(url, stage_title)
+    startup_log(message)
+    return False, message
 
 def startup_log(message: str) -> None:
     print(message)
@@ -81,6 +87,7 @@ def torch_cuda_warning() -> str:
     return ""
 
 def wait_for_comfy_ready(url: str, process: subprocess.Popen | None, timeout_seconds: float = 180.0) -> bool:
+    global STARTED_COMFY_PROCESS
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if comfy_is_running(url):
@@ -89,6 +96,8 @@ def wait_for_comfy_ready(url: str, process: subprocess.Popen | None, timeout_sec
         if process and process.poll() is not None:
             startup_log(f"ComfyUI exited before it became ready. Exit code: {process.returncode}")
             startup_log("Check the ComfyUI console window for the error.")
+            if process is STARTED_COMFY_PROCESS:
+                STARTED_COMFY_PROCESS = None
             return False
         time.sleep(2)
     startup_log(f"Timed out waiting for ComfyUI to become ready at {url}")
@@ -98,23 +107,34 @@ def wait_for_comfy_ready(url: str, process: subprocess.Popen | None, timeout_sec
 def monitor_comfy_startup(url: str, process: subprocess.Popen | None) -> None:
     wait_for_comfy_ready(url, process, float(os.environ.get("AI_REMASTER_COMFY_START_TIMEOUT", "180")))
 
-def start_comfy_if_needed() -> None:
+def comfy_startup_failure_message(url: str, stage_title: str) -> str:
+    tail = tail_text(comfy_startup_log_path(), max_lines=20)
+    detail = f" Recent startup log:\n{tail}" if tail else ""
+    return (
+        f"ComfyUI did not become ready at {url}, so {stage_title} was not started. "
+        f"Close any stuck ComfyUI window and retry. If it fails again, check the ComfyUI console "
+        f"and {comfy_startup_log_path()} for the startup error."
+        f"{detail}"
+    )
+
+def start_comfy_if_needed(monitor: bool = True) -> bool:
     global STARTED_COMFY_PROCESS
     config = current_config()
     url = config.get("comfy_url", "http://127.0.0.1:8188")
     if STARTED_COMFY_PROCESS and STARTED_COMFY_PROCESS.poll() is None:
         startup_log(f"ComfyUI launch is already in progress at {url}.")
-        return
+        return True
     instances = discover_comfy_instances(url)
     if len(instances) > 1:
         startup_log("Multiple ComfyUI instances appear to be running: " + ", ".join(instances) + ". Close extras or update .ai_remaster_config.json to the one ARP should use.")
-        return
+        return False
     if instances:
         if instances[0].rstrip("/") == url.rstrip("/"):
             startup_log(f"ComfyUI already running at {url}")
+            return True
         else:
             startup_log(f"ComfyUI appears to be running at {instances[0]}, but ARP is configured for {url}. Close it or update .ai_remaster_config.json.")
-        return
+            return False
     comfy_dir = Path(config.get("comfy_dir", str(ROOT / "tools" / "comfyui")))
     if str(config.get("comfy_managed_by_arp", "true")).lower() != "true":
         startup_log("Using an external ComfyUI checkout. ARP can start it, but install_windows.bat will not update ComfyUI core for this path.")
@@ -129,7 +149,7 @@ def start_comfy_if_needed() -> None:
         else:
             startup_log("ComfyUI is not configured yet.")
             startup_log("Run install_windows.bat again and choose whether to clone ComfyUI or use an existing ComfyUI directory.")
-        return
+        return False
     host = config.get("comfy_host", "127.0.0.1")
     port = str(config.get("comfy_port", "8188"))
     command = [sys.executable, "main.py", "--listen", host, "--port", port]
@@ -154,7 +174,9 @@ def start_comfy_if_needed() -> None:
     STARTED_COMFY_PROCESS = subprocess.Popen(command, **kwargs)
     startup_log(f"Started ComfyUI in a new console window at {url}")
     startup_log("ComfyUI is still starting; the pipeline will wait before queueing prompts.")
-    threading.Thread(target=monitor_comfy_startup, args=(url, STARTED_COMFY_PROCESS), daemon=True).start()
+    if monitor:
+        threading.Thread(target=monitor_comfy_startup, args=(url, STARTED_COMFY_PROCESS), daemon=True).start()
+    return True
 
 def stop_started_comfy() -> None:
     global STARTED_COMFY_PROCESS

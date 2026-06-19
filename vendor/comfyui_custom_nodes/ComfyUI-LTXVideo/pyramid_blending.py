@@ -10,11 +10,12 @@ from kornia.geometry.transform.pyramid import (
     build_pyramid,
     find_next_powerof_two,
     is_powerof_two,
-    pad,
 )
 from torch import Tensor
 
 from .nodes_registry import comfy_node
+
+pad = F.pad
 
 _CHUNK_SIZE = 8
 _MASK_LOW_RES_LONG_SIDE = 64

@@ -102,6 +102,7 @@ def write_outpaint_chunk_rows(path: Path, rows: list[dict[str, str]]) -> None:
         "guide_end_image",
         "guide_end_strength",
         "guide_frames",
+        "auto_start_guide",
         "anchor_image",
         "anchor_position",
         "anchor_seconds",

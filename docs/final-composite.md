@@ -21,6 +21,9 @@ Useful parameters:
 - `--feather-pixels 50` to `100`: softer or harder transition from the real source to generated sides.
 - `--saturation`: reduce colorization intensity before blending.
 - `--temperature`: negative cools, positive warms.
+- `--source-black-transparent`: let the outpainted plate show through near-black pixels in the original source layer. The GUI enables this automatically when Outpainting used "Outpaint all black regions".
+- `--source-black-threshold`: RGB threshold for that transparency mask. The default is `24`.
+- `--source-black-matte-shrink-pixels`: removes a small rim around detected black source regions so compressed or resampled black edges do not reappear over the outpainted plate. The default is `2`.
 - `--encoder prores`: bigger intermediate, friendlier for editors.
 
 The blend is an FFmpeg approximation. Resolve remains better for shot-specific mask tweaks, Color blend mode, grain, and final grade.

@@ -5,6 +5,55 @@ async function postJson(path, payload) {
   });
 }
 
+function choiceDialog({ title, message, choices }) {
+  return new Promise(resolve => {
+    const existing = document.getElementById('choiceDialogModal');
+    if (existing) existing.remove();
+
+    const modal = document.createElement('div');
+    modal.id = 'choiceDialogModal';
+    modal.className = 'image-modal';
+    modal.innerHTML = `
+      <div class="image-modal-backdrop"></div>
+      <div class="prompt-modal-panel choice-dialog-panel" role="dialog" aria-modal="true" aria-labelledby="choiceDialogTitle">
+        <div class="image-modal-heading">
+          <strong id="choiceDialogTitle"></strong>
+        </div>
+        <p id="choiceDialogMessage" class="choice-dialog-message"></p>
+        <div id="choiceDialogButtons" class="choice-dialog-buttons"></div>
+      </div>
+    `;
+
+    const finish = value => {
+      document.removeEventListener('keydown', onKeyDown);
+      modal.remove();
+      resolve(value);
+    };
+    const onKeyDown = event => {
+      if (event.key === 'Escape') finish(null);
+    };
+
+    modal.querySelector('#choiceDialogTitle').textContent = title || 'Confirm';
+    modal.querySelector('#choiceDialogMessage').textContent = message || '';
+    const buttons = modal.querySelector('#choiceDialogButtons');
+    choices.forEach(choice => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = choice.label;
+      if (choice.className) button.className = choice.className;
+      button.onclick = () => finish(choice.value);
+      buttons.appendChild(button);
+    });
+
+    modal.querySelector('.image-modal-backdrop').onclick = () => finish(null);
+    document.addEventListener('keydown', onKeyDown);
+    document.body.appendChild(modal);
+    const cancelChoice = choices.find(choice => choice.value === null);
+    const initial = cancelChoice ? buttons.children[choices.indexOf(cancelChoice)] : buttons.firstElementChild;
+    if (initial) initial.focus();
+  });
+}
+
 async function redrawWithState(nextState, snap, forceSignature = false) {
   state = nextState || await api(stateUrl());
   pruneSelected();
@@ -14,14 +63,12 @@ async function redrawWithState(nextState, snap, forceSignature = false) {
 }
 
 async function scrubShot(manifest, index, time) {
+  const snap = captureScrollState();
   const result = await postJson('/api/shot-scrub', { manifest, index, time });
   if (!result.ok) return alert(result.error || 'Could not update shot frame');
 
-  state = await api(stateUrl());
-  pruneSelected();
-  refreshShotRows('references', [index]);
-  updateRunLogs();
-  lastRenderSignature = renderSignature();
+  await refreshReferenceRowFromState(result.state, index);
+  restoreScrollState(snap);
 }
 
 async function refreshReferenceRowFromState(nextState, index) {
@@ -59,6 +106,7 @@ async function saveOutpaintChunk(index) {
 
 function outpaintChunkForm(index) {
   const customCheckbox = document.getElementById(`chunkCustom_${index}`);
+  const autoStartGuideCheckbox = document.getElementById(`chunkAutoStartGuide_${index}`);
   return {
     index,
     seed: document.getElementById(`chunkSeed_${index}`).value,
@@ -66,6 +114,7 @@ function outpaintChunkForm(index) {
     custom_seconds: outpaintChunkCustomSeconds(index),
     offset_x: document.getElementById(`chunkOffset_x_${index}`)?.value || '0',
     offset_y: document.getElementById(`chunkOffset_y_${index}`)?.value || '0',
+    auto_start_guide: autoStartGuideCheckbox ? !!autoStartGuideCheckbox.checked : true,
     prompt_suffix: document.getElementById(`chunkPrompt_${index}`).value,
     negative_suffix: document.getElementById(`chunkNegative_${index}`).value,
   };
@@ -903,8 +952,12 @@ async function splitShot(manifest, index) {
   await redrawWithState(result.state, snap, true);
 }
 
-async function setShotBoundary(manifest, index, edge, time) {
-  const result = await postJson('/api/shot-boundary', { manifest, index, edge, time });
+async function setShotBoundary(manifest, index, edge, frame) {
+  const rows = (state.shot_views && state.shot_views.shots) || [];
+  const row = rows[index] || {};
+  const fps = Math.max(1, Number(row.fps || 24));
+  const numericFrame = Math.max(0, Math.round(Number(frame) || 0));
+  const result = await postJson('/api/shot-boundary', { manifest, index, edge, frame: numericFrame, time: numericFrame / fps });
   if (!result.ok) return alert(result.error || 'Could not update shot boundary');
 
   state = result.state || await api(stateUrl());
@@ -927,11 +980,8 @@ function nudgeShotBoundary(manifest, index, edge, frames) {
   const row = rows[index];
   if (!row) return;
 
-  const frameCount = Number(row.end_frame) - Number(row.start_frame) + 1;
-  const duration = Math.max(0.001, Number(row.end) - Number(row.start));
-  const fps = Math.max(1, frameCount / duration);
-  const base = edge === 'start' ? Number(row.start) : Number(row.end);
-  setShotBoundary(manifest, index, edge, base + (Number(frames) || 0) / fps);
+  const base = edge === 'start' ? Number(row.start_frame) : Number(row.end_boundary_frame || (Number(row.end_frame) + 1));
+  setShotBoundary(manifest, index, edge, base + (Number(frames) || 0));
 }
 
 const previewTimers = {};
@@ -950,16 +1000,18 @@ function updateShotPreview(manifest, index, time, imgId, labelId) {
   }, 180);
 }
 
-function updateShotBoundaryPreview(manifest, index, time, imgId, labelId, dataset) {
+function updateShotBoundaryPreview(manifest, index, frame, imgId, labelId, dataset) {
   const label = document.getElementById(labelId);
   const edge = dataset && dataset.edge === 'end' ? 'End' : 'Start';
   const fps = Math.max(1, Number((dataset && dataset.fps) || 24));
-  const frame = Math.max(0, Math.round(Number(time || 0) * fps) - (edge === 'End' ? 1 : 0));
-  if (label) label.textContent = `${edge} frame ${frame}`;
+  const boundaryFrame = Math.max(0, Math.round(Number(frame || 0)));
+  const displayFrame = edge === 'End' ? Math.max(0, boundaryFrame - 1) : boundaryFrame;
+  if (label) label.textContent = `${edge} frame ${displayFrame}`;
 
   clearTimeout(previewTimers[imgId]);
   previewTimers[imgId] = setTimeout(async () => {
-    const previewTime = Math.max(0, Number(time || 0) + Number((dataset && dataset.previewOffset) || 0));
+    const previewFrame = Math.max(0, boundaryFrame + Number((dataset && dataset.previewOffsetFrames) || 0));
+    const previewTime = previewFrame / fps;
     const query = '?manifest=' + encodeURIComponent(manifest)
       + '&index=' + index
       + '&time=' + encodeURIComponent(previewTime);
@@ -1512,14 +1564,27 @@ async function quitArp() {
   const global = (state && state.settings && state.settings.global) || {};
   const hasProject = !!String(global.source || '').trim();
 
-  if (hasProject && confirm('Save the current project before quitting ARP?')) {
-    // OK = save first (may open a Save dialog for an unsaved project); Cancel = quit without saving.
-    const result = await postJson('/api/project-save', { save_as: false });
-    if (!result.ok) return alert(result.error || 'Could not save project. ARP is still running.');
-    if (!result.path) return; // Save dialog was cancelled — leave ARP running.
-    if (result.state) state = result.state;
-  } else if (!hasProject && !confirm('Quit ARP and close this page?')) {
-    return; // Nothing to save — confirm so a stray click does not stop the server.
+  if (hasProject) {
+    const choice = await choiceDialog({
+      title: 'Save before exit?',
+      message: 'Save the current project before quitting ARP?',
+      choices: [
+        { label: 'Yes', value: 'yes', className: 'primary' },
+        { label: 'No', value: 'no' },
+        { label: 'Cancel', value: null },
+      ],
+    });
+
+    if (choice === null) return;
+    if (choice === 'yes') {
+      // Yes = save first (may open a Save dialog for an unsaved project); No = quit without saving.
+      const result = await postJson('/api/project-save', { save_as: false });
+      if (!result.ok) return alert(result.error || 'Could not save project. ARP is still running.');
+      if (!result.path) return; // Save dialog was cancelled - leave ARP running.
+      if (result.state) state = result.state;
+    }
+  } else if (!confirm('Quit ARP and close this page?')) {
+    return; // Nothing to save - confirm so a stray click does not stop the server.
   }
 
   quitting = true; // Stop the polling loop so it does not spam errors as the server goes away.

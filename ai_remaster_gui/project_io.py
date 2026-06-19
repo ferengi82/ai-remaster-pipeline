@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import IMAGE_EXTS, ROOT, VIDEO_EXTS
+from . import state
 from .manifests import read_manifest, read_outpaint_chunk_rows
 from .paths import resolve, resolve_video_source, safe_stem
 from .runtime_settings import load_settings
@@ -17,10 +18,6 @@ PROJECT_JSON_NAME = "project.json"
 # Extensions allowed inside a project bundle. .json is included so outpaint guide sidecars
 # (resume signatures, edit metadata) travel with the guides and aren't treated as stale on load.
 BUNDLE_EXTS = IMAGE_EXTS | {".csv", ".txt", ".json"}
-
-
-def bind_context(context: dict) -> None:
-    globals().update(context)
 
 
 def source_signature(source_text: str) -> tuple[str, int, int] | None:
@@ -238,7 +235,7 @@ def project_save_suggestion(settings: dict[str, dict[str, str]], project_path: P
     return (last_dir / default_path.name) if last_dir else default_path
 
 def last_browse_dir(settings: dict[str, dict[str, str]] | None = None) -> Path | None:
-    values = settings or (APP.settings if "APP" in globals() else {})
+    values = settings or (state.APP.settings if state.APP is not None else {})
     text = values.get("global", {}).get("last_browse_dir", "") if isinstance(values, dict) else ""
     if not text:
         return None

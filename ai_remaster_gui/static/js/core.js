@@ -126,13 +126,16 @@ function updateSystemStatus() {
   const gpu = status.gpu || {};
   const ram = status.ram || {};
   const vram = status.vram || {};
-  el.innerHTML = [
-    statusBadge('CUDA', cuda.available ? 'Yes' : 'No', cuda.available ? 'ok' : 'bad', statusDetail(cuda)),
+  const cudaTone = cuda.available ? (cuda.warning ? 'warn' : 'ok') : 'bad';
+  const badges = [
+    statusBadge('CUDA', cuda.capability || (cuda.available ? 'Yes' : 'No'), cudaTone, statusDetail(cuda)),
     utilizationBadge(cpu, 'CPU'),
     utilizationBadge(gpu, 'GPU'),
     memoryBadge(ram),
     memoryBadge(vram),
-  ].join('');
+  ];
+  if (cuda.warning) badges.push(statusBadge('FlashVSR', 'Unsupported', 'warn', cuda.warning));
+  el.innerHTML = badges.join('');
   updateStickyOffsets();
 }
 
@@ -159,6 +162,7 @@ function statusDetail(item) {
   if (item.detail) details.push(String(item.detail));
   if (item.torch) details.push('torch ' + item.torch);
   if (item.cuda) details.push('CUDA ' + item.cuda);
+  if (item.warning) details.push(String(item.warning));
   return details.join(' | ');
 }
 
