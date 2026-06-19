@@ -342,6 +342,31 @@ def stitch_chunks(ffmpeg: str, chunks: list[Path], source: Path, output: Path) -
     replace_with_retry(final_partial, output, "Upscaled output")
 
 
+def ensure_flashvsr_model(args: argparse.Namespace) -> None:
+    """Download the FlashVSR weights once, serially, before any parallel ComfyUI init.
+
+    The vendored FlashVSR node's own downloader (``model_downlod``) guards on the *model
+    directory* existing, not on the weight files. When several ComfyUI instances run
+    ``FlashVSRInitPipe`` in parallel, the first creates the directory and starts a large
+    download while the others see the directory already present, skip the download, and
+    then fail with ``"diffusion_pytorch_model_streaming_dmd.safetensors" does not exist``.
+    A single idempotent ``snapshot_download`` here guarantees the weights are complete
+    before chunks fan out across instances (and recovers a partial leftover dir).
+    HF_HUB_DISABLE_XET=1 (set by the entrypoint) keeps this on plain HTTPS for the volume.
+    """
+    model = getattr(args, "flashvsr_model", "FlashVSR-v1.1")
+    model_dir = resolve_path(args.comfy_dir) / "models" / model
+    if (model_dir / "diffusion_pytorch_model_streaming_dmd.safetensors").exists():
+        return
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception:
+        return  # Fall back to the node's own downloader (fine on the single-instance path).
+    print(f"Ensuring FlashVSR model '{model}' is present (one-time download)...", flush=True)
+    snapshot_download(repo_id=f"JunhaoZhuang/{model}", local_dir=str(model_dir),
+                      local_dir_use_symlinks=False, resume_download=True)
+
+
 def chunked_flashvsr_run(args: argparse.Namespace, source: Path, output: Path, output_width: int, output_height: int, info: dict[str, Any], source_fingerprint: dict[str, Any]) -> None:
     ffmpeg = find_ffmpeg(args.ffmpeg)
     fps = args.fps or float(info["fps"])
@@ -376,6 +401,10 @@ def chunked_flashvsr_run(args: argparse.Namespace, source: Path, output: Path, o
     urls = [u.strip() for u in (getattr(args, "comfy_urls", "") or "").split(",") if u.strip()] or [args.comfy_url]
     workers = max(1, len(urls))
     print(f"Splitting upscaling into {len(ranges)} chunk(s): {args.chunk_seconds:g}s chunks, {max(0, args.overlap_frames)} overlap frame(s); {workers} GPU worker(s)", flush=True)
+    # Pre-download the FlashVSR weights once before fanning chunks out: the node's own
+    # downloader races across parallel instances (it guards on the dir, not the files).
+    if workers > 1:
+        ensure_flashvsr_model(args)
     digits = max(4, int(math.log10(len(ranges))) + 1)
 
     url_pool: "queue.Queue[str]" = queue.Queue()
