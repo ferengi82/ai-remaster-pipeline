@@ -42,6 +42,7 @@ MMAudio/Stable Audio are tens of GB — **150 GB+ recommended**).
 | `AI_REMASTER_GUI_PORT` | `8765` | ARP GUI port. |
 | `ARP_WORKSPACE` | `/workspace` | Volume mount path (match the RunPod mount). |
 | `ARP_COMFY_GPUS` | _(auto)_ | Number of ComfyUI instances to start. Auto-detected from the GPU count (`nvidia-smi`); set e.g. `1` to force single-GPU or cap it. |
+| `AI_REMASTER_ALLOWED_HOSTS` | _(auto)_ | Hostnames the GUI answers to. The GUI rejects non-loopback `Host`/`Origin` headers (DNS-rebinding guard), which would 403 the RunPod proxy URL. The entrypoint auto-allows `<pod>-<port>.proxy.runpod.net` (from `RUNPOD_POD_ID`), falling back to `*` (any host) if the pod id is unknown. Set a comma-separated list, or `*`, to override. |
 | `ARP_ENABLE_FILES` | `1` | Set `0` to disable the web file manager. |
 | `ARP_FILES_PORT` | `8888` | File manager port. |
 | `ARP_FILES_USER` | `admin` | File manager login user. |

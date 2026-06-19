@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.error import URLError
@@ -89,6 +90,19 @@ def bind_context(context: dict) -> None:
 # reach us by name (a DNS-rebinding attack), so we refuse it.
 LOOPBACK_HOSTNAMES = {"127.0.0.1", "localhost", "::1"}
 
+# Extra hostnames the GUI will answer to when it runs behind a reverse proxy (e.g. the RunPod HTTP
+# proxy, whose Host/Origin is "<pod>-8765.proxy.runpod.net", not a loopback name). Set
+# AI_REMASTER_ALLOWED_HOSTS to a comma-separated list of hostnames, or "*" to allow any host.
+# Empty by default, so a local desktop install keeps the strict loopback-only DNS-rebinding guard.
+ALLOWED_HOSTS = {h.strip().lower() for h in os.environ.get("AI_REMASTER_ALLOWED_HOSTS", "").split(",") if h.strip()}
+ALLOW_ANY_HOST = "*" in ALLOWED_HOSTS
+
+
+def hostname_is_allowed(hostname: str) -> bool:
+    """A request host/origin is accepted if it is loopback or explicitly allow-listed (see above)."""
+    name = (hostname or "").lower()
+    return ALLOW_ANY_HOST or name in LOOPBACK_HOSTNAMES or name in ALLOWED_HOSTS
+
 
 def served_source_paths() -> list[str]:
     """The selected source video lives anywhere on disk, so its folder is added to the set of
@@ -106,7 +120,7 @@ class Handler(BaseHTTPRequestHandler):
         host = self.headers.get("Host", "")
         if not host:
             return True  # a missing Host cannot carry an attacker-controlled domain
-        return (urlparse("//" + host).hostname or "").lower() in LOOPBACK_HOSTNAMES
+        return hostname_is_allowed(urlparse("//" + host).hostname or "")
 
     def request_origin_is_local(self) -> bool:
         """Reject state-changing requests carrying a cross-origin Origin/Referer. Blocks CSRF, where
@@ -114,7 +128,7 @@ class Handler(BaseHTTPRequestHandler):
         for header in ("Origin", "Referer"):
             value = self.headers.get(header, "")
             if value:
-                return (urlparse(value).hostname or "").lower() in LOOPBACK_HOSTNAMES
+                return hostname_is_allowed(urlparse(value).hostname or "")
         return True  # same-origin requests may omit both; the Host check still applies
 
     def do_GET(self) -> None:  # noqa: N802

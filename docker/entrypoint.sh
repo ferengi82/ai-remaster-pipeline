@@ -28,6 +28,17 @@ export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 export AI_REMASTER_GUI_HOST="${AI_REMASTER_GUI_HOST:-0.0.0.0}"
 export AI_REMASTER_GUI_PORT="${AI_REMASTER_GUI_PORT:-8765}"
 export AI_REMASTER_NO_BROWSER=1
+# The GUI rejects non-loopback Host/Origin headers (DNS-rebinding guard). Behind the RunPod HTTP
+# proxy the Host is "<pod>-<port>.proxy.runpod.net", which would otherwise 403. Allow that exact
+# proxy host when the pod id is known; otherwise fall back to "*" (any host) so the GUI stays
+# reachable. Override AI_REMASTER_ALLOWED_HOSTS to tighten or change it.
+if [ -z "${AI_REMASTER_ALLOWED_HOSTS:-}" ]; then
+  if [ -n "${RUNPOD_POD_ID:-}" ]; then
+    export AI_REMASTER_ALLOWED_HOSTS="${RUNPOD_POD_ID}-${AI_REMASTER_GUI_PORT}.proxy.runpod.net"
+  else
+    export AI_REMASTER_ALLOWED_HOSTS="*"
+  fi
+fi
 # The entrypoint owns ComfyUI (one instance per GPU), so the GUI must not start its own.
 export AI_REMASTER_NO_COMFY_AUTOSTART=1
 # HF_TOKEN (if set in the pod env) is inherited automatically and used for gated
