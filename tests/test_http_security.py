@@ -10,8 +10,10 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ai_remaster_gui import config, http_handler
+from ai_remaster_gui import paths
 from ai_remaster_gui import server  # noqa: F401  (imported for its bind_context side effect)
 from ai_remaster_gui.paths import resolve_served
 
@@ -32,6 +34,24 @@ class ResolveServedTests(unittest.TestCase):
 
     def test_empty_path_is_rejected(self) -> None:
         self.assertIsNone(resolve_served(""))
+
+    def test_relocated_cache_and_data_roots_are_allowed(self) -> None:
+        # On RunPod ARP_DATA_DIR/ARP_CACHE_DIR move previews, clips, intermediates and outputs
+        # off the code tree (onto the volume). rel() then yields an absolute URL, so served_roots
+        # must include those roots or every preview 404s.
+        with tempfile.TemporaryDirectory() as cache, tempfile.TemporaryDirectory() as data:
+            preview = Path(cache) / "previews" / "frame.jpg"
+            preview.parent.mkdir(parents=True)
+            preview.write_bytes(b"\xff\xd8\xff")
+            intermediate = Path(data) / "intermediate" / "clip.mp4"
+            intermediate.parent.mkdir(parents=True)
+            intermediate.write_bytes(b"\x00")
+            with mock.patch.object(paths, "CACHE_ROOT", Path(cache)), \
+                    mock.patch.object(paths, "DATA_ROOT", Path(data)):
+                self.assertIsNotNone(resolve_served(str(preview)))
+                self.assertIsNotNone(resolve_served(str(intermediate)))
+            # Outside the patched roots it is rejected again (allowlist still holds).
+            self.assertIsNone(resolve_served(str(preview)))
 
     def test_selected_source_folder_is_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

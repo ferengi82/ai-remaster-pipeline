@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from pathlib import Path
 
-from .config import ROOT, VIDEO_EXTS, comfy_dir_for
+from .config import CACHE_ROOT, DATA_ROOT, ROOT, VIDEO_EXTS, comfy_dir_for
 
 
 def rel(path: Path) -> str:
@@ -29,10 +29,12 @@ def is_within(path: Path, root: Path) -> bool:
 
 def served_roots(extra_paths: Iterable[str] = ()) -> list[Path]:
     """Directories the GUI may read files from when answering browser requests: the project
-    tree, the ComfyUI install (and its output folder), and the folder of any explicitly
+    tree, the relocatable data/cache roots (ARP_DATA_DIR/ARP_CACHE_DIR — where previews,
+    media clips, intermediates and outputs live when moved off the code tree, e.g. the RunPod
+    volume), the ComfyUI install (and its output folder), and the folder of any explicitly
     chosen file passed in extra_paths (the source video legitimately lives anywhere on disk)."""
     comfy_dir = Path(comfy_dir_for())
-    roots = [ROOT, comfy_dir, comfy_dir / "output"]
+    roots = [ROOT, DATA_ROOT, CACHE_ROOT, comfy_dir, comfy_dir / "output"]
     for text in extra_paths:
         if not text:
             continue
