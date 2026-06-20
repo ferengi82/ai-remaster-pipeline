@@ -20,6 +20,11 @@ PROJECT_JSON_NAME = "project.json"
 BUNDLE_EXTS = IMAGE_EXTS | {".csv", ".txt", ".json"}
 
 
+def bind_context(context: dict) -> None:
+    """Bind GUI helpers used to identify the active outpaint chunk manifest."""
+    globals().update({key: context[key] for key in ("outpaint_chunk_manifest_for", "pipeline_source_text") if key in context})
+
+
 def source_signature(source_text: str) -> tuple[str, int, int] | None:
     if not source_text:
         return None
@@ -90,7 +95,7 @@ def load_project_payload(data: dict) -> dict[str, dict[str, str]]:
 
 def project_asset_paths(settings: dict[str, dict[str, str]]) -> list[Path]:
     candidates: list[str] = []
-    for key in ("shots", "references", "colour", "recomp"):
+    for key in ("outpaint", "shots", "references", "colour", "recomp"):
         manifest = settings.get(key, {}).get("manifest", "")
         if manifest:
             candidates.append(manifest)
@@ -149,32 +154,46 @@ def chunk_guide_image_texts(manifest: Path) -> list[str]:
     return texts
 
 def outpaint_guide_asset_paths(settings: dict[str, dict[str, str]]) -> list[Path]:
-    # The outpaint chunk manifest is identity-keyed now (e.g. Metropolis_chunks_<key>.csv), so
-    # locate it precisely via the same GUI helper that names it, rather than by stem prefix
-    # (which also avoids bundling other sections of the same film). These helpers are injected
-    # from server.py via bind_context.
+    # The outpaint chunk manifest is user-authored project state: custom lengths, seeds, offsets,
+    # guide strengths, and guide image references all live there. Prefer any explicit settings
+    # pointer, then use the same GUI helper that names the active manifest so Save Project can
+    # preserve guide work even when the cache itself has been cleared.
+    manifests: list[Path] = []
+    seen_manifests: set[Path] = set()
+    explicit = settings.get("outpaint", {}).get("manifest", "")
+    if explicit:
+        manifest = resolve(explicit)
+        if project_asset_is_bundleable(manifest):
+            seen_manifests.add(manifest)
+            manifests.append(manifest)
+
     chunk_manifest_for = globals().get("outpaint_chunk_manifest_for")
     pipeline_source = globals().get("pipeline_source_text")
-    if not chunk_manifest_for or not pipeline_source:
-        return []
-    try:
-        manifest_text = chunk_manifest_for(pipeline_source(settings), settings.get("outpaint", {}))
-    except Exception:
-        return []
-    manifest = resolve(manifest_text) if manifest_text else None
-    if not manifest or not project_asset_is_bundleable(manifest):
-        return []
-    assets: list[Path] = [manifest]
-    seen: set[Path] = {manifest}
-    for image_text in chunk_guide_image_texts(manifest):
-        image = resolve(image_text)
-        # Bundle the guide image and its resume/edit sidecars so reloaded guides are used
-        # as-is and not treated as stale.
-        for candidate in (image, Path(str(image) + ".sig.json"), Path(str(image) + ".json")):
-            if candidate not in seen and project_asset_is_bundleable(candidate):
-                seen.add(candidate)
-                assets.append(candidate)
-        seen.add(image)
+    if chunk_manifest_for and pipeline_source:
+        try:
+            manifest_text = chunk_manifest_for(pipeline_source(settings), settings.get("outpaint", {}))
+            manifest = resolve(manifest_text) if manifest_text else None
+            if manifest and project_asset_is_bundleable(manifest) and manifest not in seen_manifests:
+                seen_manifests.add(manifest)
+                manifests.append(manifest)
+        except Exception:
+            pass
+
+    assets: list[Path] = []
+    seen_assets: set[Path] = set()
+    for manifest in manifests:
+        if manifest not in seen_assets:
+            seen_assets.add(manifest)
+            assets.append(manifest)
+        for image_text in chunk_guide_image_texts(manifest):
+            image = resolve(image_text)
+            # Bundle the guide image and its resume/edit sidecars so reloaded guides are used
+            # as-is and not treated as stale.
+            for candidate in (image, Path(str(image) + ".sig.json"), Path(str(image) + ".json")):
+                if candidate not in seen_assets and project_asset_is_bundleable(candidate):
+                    seen_assets.add(candidate)
+                    assets.append(candidate)
+            seen_assets.add(image)
     return assets
 
 def project_asset_is_bundleable(path: Path) -> bool:

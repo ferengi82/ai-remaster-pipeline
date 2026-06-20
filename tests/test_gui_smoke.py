@@ -37,6 +37,7 @@ import qwen_colorize_references  # noqa: E402
 import upscale_video  # noqa: E402
 
 from ai_remaster_gui import app
+from ai_remaster_gui import cache
 from ai_remaster_gui import config
 from ai_remaster_gui import lifecycle
 from ai_remaster_gui import media
@@ -1113,6 +1114,44 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertIn("color_reference", fields)
             self.assertEqual(rows[0]["source_reference"], "bw.png")
 
+    def test_shot_rows_marks_only_active_edit_reference_as_edited(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            manifest = folder / f"{folder.name}_refs.csv"
+            original = folder / "color.png"
+            source = folder / "bw.png"
+            original.write_bytes(b"original")
+            source.write_bytes(b"source")
+            edit_dir = app.ROOT / "intermediate" / "outpainted_references_color_edits" / app.safe_stem(app.resolve(manifest).stem) / "shot_0000"
+            edit_dir.mkdir(parents=True, exist_ok=True)
+            edit = edit_dir / "edit_20260619_120000.png"
+            edit.write_bytes(b"edited")
+            try:
+                app.write_manifest_details(
+                    manifest,
+                    "input/example.mp4",
+                    ["enabled", "end", "source_reference", "color_reference", "color_reference_previous"],
+                    [
+                        {
+                            "enabled": "true",
+                            "end": "00:00:01.000",
+                            "source_reference": app.rel(source),
+                            "color_reference": app.rel(original),
+                            "color_reference_previous": app.rel(edit),
+                        }
+                    ],
+                )
+
+                normal = app.shot_rows(str(manifest))[0]
+                app.update_manifest_row(manifest, 0, {"color_reference": app.rel(edit), "color_reference_previous": app.rel(original)})
+                edited = app.shot_rows(str(manifest))[0]
+            finally:
+                shutil.rmtree(edit_dir.parent, ignore_errors=True)
+
+        self.assertTrue(normal["color_reference_versions"])
+        self.assertFalse(normal["color_reference_edited"])
+        self.assertTrue(edited["color_reference_edited"])
+
     def test_reference_paint_save_installs_painted_image_with_revert_history(self) -> None:
         import base64
 
@@ -1817,6 +1856,54 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertIn(app.rel(source).replace("\\", "/"), names)
             self.assertIn(app.rel(color).replace("\\", "/"), names)
             self.assertNotIn("openai_api_key", payload["settings"]["references"])
+
+    def test_cache_categories_do_not_include_project_state(self) -> None:
+        folders_by_key = {
+            category["key"]: {app.rel(folder).replace("\\", "/") for folder in category["folders"]}
+            for category in cache.cache_categories()
+        }
+
+        self.assertNotIn("intermediate/outpaint_guides", folders_by_key["outpaint"])
+        self.assertNotIn("intermediate/outpaint_anchors", folders_by_key["outpaint"])
+        self.assertNotIn("manifests/outpaint_chunks", folders_by_key["outpaint"])
+        self.assertNotIn("manifests/references", folders_by_key["shots"])
+        self.assertNotIn("intermediate/outpainted_references", folders_by_key["references"])
+        self.assertNotIn("intermediate/outpainted_references_color", folders_by_key["references"])
+
+    def test_project_bundle_includes_outpaint_chunk_manifest_and_guides(self) -> None:
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:
+            folder = Path(tmp_text)
+            manifest = folder / "chunks.csv"
+            guide = folder / "guide.png"
+            guide_previous = folder / "guide_previous.png"
+            project = folder / "demo.arpp"
+            guide.write_bytes(b"guide")
+            guide_previous.write_bytes(b"previous")
+            Path(str(guide) + ".json").write_text("{}", encoding="utf-8")
+            app.write_outpaint_chunk_rows(
+                manifest,
+                [
+                    {
+                        "chunk_index": "0",
+                        "start_frame": "0",
+                        "end_frame": "24",
+                        "guide_image": app.rel(guide),
+                        "guide_frames": json.dumps([{"image": app.rel(guide), "image_previous": app.rel(guide_previous)}]),
+                    }
+                ],
+            )
+            settings = copy.deepcopy(app.APP.settings)
+            settings.setdefault("outpaint", {})["manifest"] = app.rel(manifest)
+
+            app.write_project_file(project, settings)
+
+            with zipfile.ZipFile(project) as archive:
+                names = set(archive.namelist())
+
+            self.assertIn(app.rel(manifest).replace("\\", "/"), names)
+            self.assertIn(app.rel(guide).replace("\\", "/"), names)
+            self.assertIn(app.rel(guide_previous).replace("\\", "/"), names)
+            self.assertIn((app.rel(guide) + ".json").replace("\\", "/"), names)
 
     def test_project_load_skips_assets_already_on_disk(self) -> None:
         with tempfile.TemporaryDirectory(dir=app.ROOT) as tmp_text:

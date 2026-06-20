@@ -93,6 +93,8 @@ def shot_rows(manifest_text: str, include_previews: bool = False) -> list[dict[s
         selected_frame = optional_int(row.get("selected_frame"))
         selected = (selected_frame / fps) if selected_frame is not None else selected_seconds_from_reference(row.get("source_reference", "")) or ((start + end) / 2 if end > start else start)
         selected = max(start, min(end, selected))
+        color_reference = row.get("color_reference", "")
+        color_reference_versions = reference_edit_versions(manifest_text, index)
         item = {
                 "index": index,
                 "enabled": row.get("enabled", "true"),
@@ -111,11 +113,12 @@ def shot_rows(manifest_text: str, include_previews: bool = False) -> list[dict[s
                 "end_label": format_timecode(end),
                 "selected_label": format_timecode(selected),
                 "source_reference": row.get("source_reference", ""),
-                "color_reference": row.get("color_reference", ""),
+                "color_reference": color_reference,
                 "source_reference_mtime": file_mtime(row.get("source_reference", "")),
-                "color_reference_mtime": file_mtime(row.get("color_reference", "")),
+                "color_reference_mtime": file_mtime(color_reference),
                 "recent_color_references": recent_color_references(rows, index),
-                "color_reference_versions": reference_edit_versions(manifest_text, index),
+                "color_reference_versions": color_reference_versions,
+                "color_reference_edited": bool(color_reference and color_reference in color_reference_versions),
                 "masked_edit_available": bool(state.APP.settings.get("references", {}).get("masked_workflow", "")),
                 "can_merge_next": index < len(rows) - 1,
                 "can_split": end - start >= 0.1,

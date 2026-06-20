@@ -34,30 +34,24 @@ def cache_categories() -> tuple[dict, ...]:
         {
             "key": "outpaint",
             "title": "Outpainting",
-            "description": "Prepared inputs, guide frames, per-chunk LTX renders, chunk manifests, and stitched outpainted videos.",
+            "description": "Prepared inputs, per-chunk LTX renders, and stitched outpainted videos.",
             "folders": (
                 CACHE_ROOT / "outpaint_chunks",
-                DATA_ROOT / "intermediate" / "outpaint_guides",
-                DATA_ROOT / "intermediate" / "outpaint_anchors",  # legacy name
                 DATA_ROOT / "intermediate" / "outpaint_prepared",
                 DATA_ROOT / "intermediate" / "outpainted",
-                DATA_ROOT / "manifests" / "outpaint_chunks",
             ),
         },
         {
             "key": "shots",
             "title": "Shot Detection",
-            "description": "Shot manifests created by cut detection.",
-            "folders": (DATA_ROOT / "manifests" / "references",),
+            "description": "Shot manifests are project state and are not removed by cache clearing.",
+            "folders": (),
         },
         {
             "key": "references",
             "title": "Reference Generation",
-            "description": "Black-and-white shot screenshots and Qwen color reference stills.",
-            "folders": (
-                DATA_ROOT / "intermediate" / "outpainted_references",
-                DATA_ROOT / "intermediate" / "outpainted_references_color",
-            ),
+            "description": "Shot reference images are project state and are not removed by cache clearing.",
+            "folders": (),
         },
         {
             "key": "colour",

@@ -396,7 +396,7 @@ function colorReferenceThumb(manifest, idx, colorUrl, row) {
   return `
     <div class="thumb-wrap">
       <img src="${colorUrl}" alt="" onclick="openReferenceEditor('${esc(manifest)}',${idx})" title="Open advanced reference editor">
-      ${(row.color_reference_versions || []).length ? '<span class="edit-badge">Edited</span>' : ''}
+      ${row.color_reference_edited ? '<span class="edit-badge">Edited</span>' : ''}
       <button class="icon-button" type="button" title="Delete color reference" onclick="deleteReference('${esc(manifest)}',${idx})">&#128465;</button>
     </div>
   `;
